@@ -1,0 +1,6 @@
+I am an ML Engineer with 8 years of experience in data science. 
+My expertise includes Python, Sagemaker, RNNs.
+
+Currently, I'm focused on AI.
+
+My background includes economics.

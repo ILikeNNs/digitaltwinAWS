@@ -1,0 +1,21 @@
+{
+    "full_name": "Lukasz Korona",
+    "name": "mess1989",
+    "current_role": "ML Engineer",
+    "location": "Warsaw",
+    "email": "korona.lukasz@gmail.com",
+    "linkedin": "linkedin.com/in/lukasz.korona",
+    "specialties": [
+      "RNNs",
+      "Sagemaker",
+      "Constant learning"
+    ],
+    "years_experience": 8,
+    "education": [
+      {
+        "degree": "Master",
+        "institution": "Warsaw School of Economics",
+        "year": "2013"
+      }
+    ]
+  }
