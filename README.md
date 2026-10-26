@@ -11,10 +11,31 @@ There are two tools used in the project:
 ### Modules written
 
 The project is modularized (as it should be):
-- **app.py** contains code for the Gradio-based web UI
-- **database.py** contains code for setting up an sqlite database, as well as code for logging the conversations and contact details of interlocutors (in a separate table)
-- **helpers.py** contains tool definitions
-- **rag_engine.py** contains a RAGEngine class which contains methods for chunking the resume text, as well as retrieving the relevant context/chunks for a given question
+
+**The app (Gradio, runs locally and on EC2)**
+- **app.py** contains the Gradio web UI. Replies stream as they're generated, and the conversation is kept server-side, so visitors can't rewrite earlier turns.
+- **helpers.py** contains what both versions share: the persona prompt, model settings and spend limits, the tool definitions, input sanitizing, and the streaming tool-calling loop.
+- **database.py** contains the SQLite logging of conversations (deleted after a year) and contact requests (with an email check and an hourly cap).
+- **rag_engine.py** contains a RAGEngine class that chunks the resume, stores it in Chroma and retrieves the most relevant chunks for a question.
+
+**The serverless version (`serverless/`)**
+- **server.py** is the chat API: a Starlette app run inside Lambda by the Lambda Web Adapter. It streams replies, keeps sessions, logs and contact requests in DynamoDB, and reloads the OpenAI key if it's rotated.
+- **retriever.py** searches pre-computed resume embeddings in memory: the same interface as RAGEngine, without a vector database.
+- **package.py** builds the Lambda zip: it embeds the resume when the PDF changes and installs the locked dependencies for Lambda's arm64 runtime.
+- **run.sh** is the Lambda handler that starts the app under the Web Adapter.
+- **web/** contains the static chat page (`index.html`, `app.js`, `style.css`).
+
+**Infrastructure (`infra/`)**
+- **serverless.yaml**, **digitaltwin.yaml** (EC2), **waf.yaml** and **pipeline.yaml** are the CloudFormation templates.
+- **deploy.py** builds, uploads and deploys either version, and also stores the OpenAI key (`set-openai-key`), audits dependencies, smoke-tests the live site and bootstraps the pipeline.
+- **deploy.ps1** / **deploy-serverless.ps1** are thin PowerShell wrappers around it; **destroy.ps1** / **destroy-serverless.ps1** (with **common.ps1**) tear the stacks down.
+- **guard/** contains the cfn-guard security rules the pipeline enforces.
+
+**CI/CD (`buildspecs/`)**
+- **build.yml** and **publish.yml** are the CodeBuild steps of the pipeline: quality gates and packaging, then site publishing and smoke tests.
+
+**Tests (`tests/`)**
+- **test_digitaltwin.py** covers the Gradio app, the database and the RAG engine; **test_server.py** the Lambda API's key handling; **test_deploy.py** the deploy tooling (with AWS calls stubbed) and the consistency between templates and buildspecs; **test_serverless_package.py** the Lambda startup script. **conftest.py** loads modules with stubbed dependencies.
 
 ### Deploying to AWS
 
