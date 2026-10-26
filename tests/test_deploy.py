@@ -341,19 +341,42 @@ def test_verify_openai_key_explains_failures(deploy, monkeypatch, error_name, me
         deploy.verify_openai_key("sk-test")
 
 
-@pytest.mark.parametrize("stale, env_key, expect_secret_read", [
-    (True, None, True),        # re-embedding locally: key comes from Secrets Manager
-    (True, "sk-env", False),   # CodeBuild: secret already mapped to OPENAI_API_KEY
-    (False, None, False),      # resume unchanged: no key needed at all
+class _FakeS3:
+    def __init__(self, cached):
+        self.cached, self.calls = cached, []
+
+    def download_file(self, bucket, key, path):
+        self.calls.append(("download", key))
+        if not self.cached:
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject")
+        with open(path, "w") as f:
+            f.write("{}")
+
+    def upload_file(self, path, bucket, key):
+        self.calls.append(("upload", key))
+
+
+@pytest.mark.parametrize("stale, cached, env_key, expected", [
+    # resume unchanged: nothing to fetch, no key needed
+    (False, False, None, []),
+    # resume changed, but embedded before (any machine): reuse the cache, no OpenAI call
+    (True, True, None, ["download"]),
+    # first build of a new resume locally: key from Secrets Manager, embed, cache the result
+    (True, False, None, ["download", "secret", "build_index:sk-secret", "upload"]),
+    # first build of a new resume on CodeBuild: key already in the environment
+    (True, False, "sk-env", ["download", "build_index:sk-env", "upload"]),
 ])
-def test_build_serverless_gets_key_only_when_needed(deploy, monkeypatch, tmp_path, stale, env_key, expect_secret_read):
+def test_build_serverless_embeds_only_on_cache_miss(deploy, monkeypatch, tmp_path, stale, cached, env_key, expected):
     import sys
     import types
 
-    calls = []
+    events = []
     fake_package = types.SimpleNamespace(
+        INDEX_PATH=str(tmp_path / "embeddings.json"),
         index_is_stale=lambda: stale,
-        build_index=lambda: calls.append(("build_index", os.environ.get("OPENAI_API_KEY"))),
+        pdf_sha256=lambda: "abc123",
+        build_index=lambda: events.append(f"build_index:{os.environ.get('OPENAI_API_KEY')}"),
         build_zip=lambda out_dir: os.path.join(out_dir, "chat.zip"),
     )
     monkeypatch.setitem(sys.modules, "package", fake_package)
@@ -361,13 +384,21 @@ def test_build_serverless_gets_key_only_when_needed(deploy, monkeypatch, tmp_pat
         monkeypatch.setenv("OPENAI_API_KEY", env_key)
     else:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setattr(deploy, "read_openai_key", lambda sm, name: calls.append("secret") or "sk-secret")
-    monkeypatch.setattr(deploy.boto3, "client", lambda *a, **k: None)
+    monkeypatch.setattr(deploy, "read_openai_key", lambda sm, name: events.append("secret") or "sk-secret")
 
-    assert deploy.build_serverless(str(tmp_path)) == os.path.join(str(tmp_path), "chat.zip")
-    assert ("secret" in calls) == expect_secret_read
-    expected_key = "sk-secret" if expect_secret_read else env_key
-    assert calls[-1] == ("build_index", expected_key)
+    s3 = _FakeS3(cached)
+    session = types.SimpleNamespace(
+        region_name="eu-north-1",
+        client=lambda service, **kw: s3 if service == "s3" else types.SimpleNamespace(
+            get_caller_identity=lambda: {"Account": "123456789012"}),
+    )
+
+    assert deploy.build_serverless(str(tmp_path), session) == os.path.join(str(tmp_path), "chat.zip")
+    timeline = [c[0] for c in s3.calls] + events
+    order = {"download": 0, "secret": 1}
+    timeline.sort(key=lambda e: order.get(e, 2 if e.startswith("build_index") else 3))
+    assert timeline == expected
+    assert all(key == "embeddings/abc123.json" for _, key in s3.calls)
 
 
 # ======================= pipeline bootstrap =======================
@@ -470,3 +501,33 @@ def test_pipeline_parameter_overrides_match_the_app_template():
     assert set(overrides) <= set(app["Parameters"]), "pipeline overrides parameters serverless.yaml doesn't declare"
     assert "PermissionsBoundaryArn" in overrides  # the escalation guard only works if the pipeline always sets it
     assert deploy_action["Configuration"]["TemplateConfiguration"] == "BuildOutput::params.json"
+
+
+# ======================= dependency audit =======================
+
+@pytest.mark.parametrize("lambda_vulnerable, others_vulnerable, outcome", [
+    (False, False, "pass"),
+    (False, True, "warn"),   # Gradio/EC2/dev packages aren't deployed by this pipeline: report, don't block
+    (True, False, "fail"),   # what the Lambda ships: block the deploy
+])
+def test_audit_blocks_only_on_lambda_vulnerabilities(deploy, monkeypatch, tmp_path, capsys,
+                                                     lambda_vulnerable, others_vulnerable, outcome):
+    import sys
+    import types
+
+    monkeypatch.setitem(sys.modules, "package", types.SimpleNamespace(
+        LAMBDA_PYTHON="3.13", LAMBDA_PLATFORM="aarch64-manylinux2014", RUNTIME_PACKAGES=["openai"]))
+
+    def fake_run(cmd, **kwargs):
+        failed = cmd[0] == "uvx" and (
+            (cmd[-1].endswith("requirements-lambda.txt") and lambda_vulnerable)
+            or (cmd[-1].endswith("requirements-all.txt") and others_vulnerable))
+        return types.SimpleNamespace(returncode=1 if failed else 0)
+
+    monkeypatch.setattr(deploy.subprocess, "run", fake_run)
+    if outcome == "fail":
+        with pytest.raises(RuntimeError, match="Lambda's dependencies"):
+            deploy.audit_dependencies(str(tmp_path))
+    else:
+        deploy.audit_dependencies(str(tmp_path))
+        assert ("WARNING" in capsys.readouterr().out) == (outcome == "warn")

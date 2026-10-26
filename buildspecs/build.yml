@@ -1,0 +1,65 @@
+# Build stage of the CI/CD pipeline (infra/pipeline.yaml, BuildProject).
+#
+# Quality gates first: any failing command fails the build and stops the pipeline before anything is deployed.
+# Then the Lambda package is built and uploaded, and the deploy stage gets two files:
+#   serverless.yaml  the template to deploy
+#   params.json      CodeBucket / CodeKey / CodeVersionId of the uploaded package (CloudFormation template configuration)
+#
+# Tool versions are pinned; the cfn-guard binary is verified against a SHA-256 recorded when it was first vetted.
+
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    UV_VERSION: "0.13.5"
+    CFN_LINT_VERSION: "1.58.0"
+    CFN_GUARD_VERSION: "3.2.1"
+    CFN_GUARD_SHA256: "cd378026dad0f865926ab1d1c082e2faf825f7fd888a9fe6b5c142cdf175c129"  # aarch64-linux tarball
+    UV_CACHE_DIR: /root/.cache/uv
+    UV_LINK_MODE: copy
+    UV_NO_PROGRESS: "1"
+    # OPENAI_SECRET_NAME comes from the CodeBuild project; AWS_REGION is set by CodeBuild
+
+phases:
+  install:
+    commands:
+      - python3 -m pip install --quiet --disable-pip-version-check "uv==${UV_VERSION}"
+      - uv sync --frozen --group deploy
+      - curl -fsSL -o /tmp/cfn-guard.tar.gz "https://github.com/aws-cloudformation/cloudformation-guard/releases/download/${CFN_GUARD_VERSION}/cfn-guard-v3-aarch64-linux-latest.tar.gz"
+      - echo "${CFN_GUARD_SHA256}  /tmp/cfn-guard.tar.gz" | sha256sum --check --strict -
+      - tar -xzf /tmp/cfn-guard.tar.gz -C /tmp
+      - install -m 0755 /tmp/cfn-guard-v3-aarch64-linux-latest/cfn-guard /usr/local/bin/cfn-guard
+
+  pre_build:
+    commands:
+      # Unit tests (app, serverless handler, deploy tooling, template consistency)
+      - uv run --frozen --group deploy pytest -q
+      # Template correctness
+      - uvx "cfn-lint==${CFN_LINT_VERSION}" --regions "${AWS_REGION}" -- infra/serverless.yaml infra/pipeline.yaml infra/digitaltwin.yaml
+      - uvx "cfn-lint==${CFN_LINT_VERSION}" --regions us-east-1 -- infra/waf.yaml
+      # Security rules (infra/guard): baseline for all templates, invariants for the stack this pipeline deploys
+      - cfn-guard validate --rules infra/guard/common.guard --data infra/serverless.yaml --data infra/pipeline.yaml --data infra/digitaltwin.yaml --data infra/waf.yaml --show-summary fail
+      - cfn-guard validate --rules infra/guard/serverless.guard --data infra/serverless.yaml --show-summary fail
+      # Known vulnerabilities: fail on what the Lambda ships, report the rest of the lockfile
+      - uv run --frozen --group deploy python infra/deploy.py audit --work-dir dist/audit
+
+  build:
+    commands:
+      # Embeds the resume only if linkedin.pdf changed (embeddings are cached in the artifact bucket by PDF hash).
+      # No pipe here: the command's own exit status must fail the build (stdout carries only the zip path).
+      - ZIP=$(uv run --frozen --group deploy python infra/deploy.py build serverless --out-dir dist --secret-name "${OPENAI_SECRET_NAME}" --region "${AWS_REGION}")
+      - echo "Built ${ZIP}"
+      # Content-hashed key: an unchanged package reuses the uploaded version, so the deploy stage is a no-op
+      - uv run --frozen --group deploy python infra/deploy.py publish serverless --zip "${ZIP}" --params-out params.json --region "${AWS_REGION}"
+      - cp infra/serverless.yaml serverless.yaml
+      - cat params.json
+
+artifacts:
+  files:
+    - serverless.yaml
+    - params.json
+
+cache:
+  paths:
+    - /root/.cache/uv/**/*

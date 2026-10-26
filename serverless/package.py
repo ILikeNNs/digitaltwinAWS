@@ -47,6 +47,11 @@ def _sha256(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+def pdf_sha256():
+    """Identifies the resume version; embeddings are cached under this hash so unchanged resumes are never re-embedded."""
+    return _sha256(PDF_PATH)
+
+
 def index_is_stale():
     """True when embeddings.json is missing or was built from a different linkedin.pdf (embedding needs the API key)."""
     if not os.path.exists(INDEX_PATH):

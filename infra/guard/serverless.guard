@@ -1,0 +1,45 @@
+# Invariants specific to infra/serverless.yaml, the stack the pipeline deploys.
+
+# The Function URL must only be callable by CloudFront (OAC-signed); NONE would expose a public URL that skips WAF
+let function_urls = Resources.*[ Type == 'AWS::Lambda::Url' ]
+rule function_url_requires_iam {
+    %function_urls !empty
+    %function_urls.Properties.AuthType == 'AWS_IAM'
+    <<
+        Violation: the chat Function URL must use AuthType AWS_IAM
+    >>
+}
+
+# Every role this stack creates must accept the pipeline's permissions boundary (privilege-escalation guard)
+let roles = Resources.*[ Type == 'AWS::IAM::Role' ]
+rule roles_take_the_permissions_boundary when %roles !empty {
+    %roles.Properties.PermissionsBoundary exists
+    <<
+        Violation: IAM roles in serverless.yaml must set PermissionsBoundary (the pipeline's deploy role requires it)
+    >>
+}
+
+# The table holds visitors' contact requests: never deleted with the stack, never replaced by accident
+let tables = Resources.*[ Type == 'AWS::DynamoDB::Table' ]
+rule contact_data_is_protected {
+    %tables !empty
+    %tables {
+        DeletionPolicy == 'Retain'
+        UpdateReplacePolicy == 'Retain'
+        Properties.DeletionProtectionEnabled == true
+        <<
+            Violation: the DynamoDB table must be retained and deletion-protected (it holds contact requests)
+        >>
+    }
+}
+
+# WAF (per-IP rate limit) and the concurrency cap are the OpenAI spend guards; the template must support both
+let distributions = Resources.*[ Type == 'AWS::CloudFront::Distribution' ]
+let functions = Resources.*[ Type == 'AWS::Lambda::Function' ]
+rule spend_guards_wired {
+    %distributions.Properties.DistributionConfig.WebACLId exists
+    %functions.Properties.ReservedConcurrentExecutions exists
+    <<
+        Violation: the distribution must accept a WAF web ACL and the function a reserved concurrency cap
+    >>
+}

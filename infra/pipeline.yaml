@@ -478,17 +478,19 @@ Resources:
                 Effect: Allow
                 Action: [kms:Decrypt, kms:GenerateDataKey*]
                 Resource: !GetAtt ArtifactKey.Arn
-              - Sid: UploadLambdaPackages
+              - Sid: UploadLambdaPackagesAndCacheEmbeddings
                 Effect: Allow
                 Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
-                Resource: !Sub "arn:${AWS::Partition}:s3:::${CodeBucketName}/lambda/*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${CodeBucketName}/lambda/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${CodeBucketName}/embeddings/*"
               - Sid: TellMissingFromForbidden
                 # Without ListBucket, HeadObject on a missing key returns 403 instead of 404
                 Effect: Allow
                 Action: s3:ListBucket
                 Resource: !Sub "arn:${AWS::Partition}:s3:::${CodeBucketName}"
                 Condition:
-                  StringLike: { s3:prefix: ["lambda/*"] }
+                  StringLike: { s3:prefix: ["lambda/*", "embeddings/*"] }
               - Sid: OpenAIKeyForEmbedding
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
@@ -510,8 +512,11 @@ Resources:
         ComputeType: BUILD_GENERAL1_SMALL
         Image: aws/codebuild/amazonlinux2-aarch64-standard:4.0
         EnvironmentVariables:
-          - { Name: CODE_BUCKET, Value: !Ref CodeBucketName }
           - { Name: OPENAI_SECRET_NAME, Value: !Ref OpenAIApiKeySecretName }
+      Cache:
+        # uv's download cache (buildspecs/build.yml); best-effort on on-demand hosts
+        Type: LOCAL
+        Modes: [LOCAL_CUSTOM_CACHE]
       TimeoutInMinutes: 30
       LogsConfig:
         CloudWatchLogs:

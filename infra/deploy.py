@@ -7,6 +7,7 @@
                             template configuration file (for a pipeline's CloudFormation deploy action)
   publish-site              sync serverless/web to the site bucket and invalidate CloudFront
   waf                       deploy the WAF web ACL stack (us-east-1) and print its ARN
+  audit                     scan dependencies for known vulnerabilities (fails on what the Lambda ships)
   pipeline                  bootstrap or update the CI/CD pipeline stack (infra/pipeline.yaml) for the serverless app
 
 Run with the deploy dependency group, e.g.:  uv run --group deploy python infra/deploy.py deploy serverless
@@ -16,6 +17,7 @@ import getpass
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -33,6 +35,8 @@ WEB_DIR = os.path.join(ROOT, "serverless", "web")
 DEFAULT_REGION = "eu-north-1"
 WAF_REGION = "us-east-1"
 DEFAULT_SECRET_NAME = "digitaltwin/openai-api-key"
+EMBEDDINGS_CACHE_PREFIX = "embeddings/"  # in the artifact bucket, keyed by linkedin.pdf's SHA-256
+PIP_AUDIT = "pip-audit==2.10.1"
 INLINE_TEMPLATE_LIMIT = 51_200  # bytes CloudFormation accepts as TemplateBody
 
 EC2_APP_FILES = ["app.py", "database.py", "helpers.py", "rag_engine.py", "pyproject.toml", "uv.lock", "linkedin.pdf"]
@@ -98,25 +102,75 @@ def build_ec2(out_dir):
     return path
 
 
-def build_serverless(out_dir, secret_name=DEFAULT_SECRET_NAME, region=DEFAULT_REGION):
-    """Embeds the resume if linkedin.pdf changed, then builds the arm64 Lambda zip (serverless/package.py).
+def _download_if_exists(s3, bucket, key, path):
+    try:
+        s3.download_file(bucket, key, path)
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey", "NoSuchBucket"):
+            return False
+        raise
 
-    Embedding needs the OpenAI key: OPENAI_API_KEY when set (CodeBuild maps the secret to it), otherwise it is read
-    from the Secrets Manager secret, so no local .env file is needed. Unchanged resumes need no key at all.
+
+def build_serverless(out_dir, session, secret_name=DEFAULT_SECRET_NAME):
+    """Builds the arm64 Lambda zip (serverless/package.py), embedding the resume only when linkedin.pdf changed.
+
+    Embeddings are cached in the artifact bucket under the PDF's hash. Embedding is not bit-for-bit reproducible, so
+    without the cache every CI build (which starts without embeddings.json) would change the package and redeploy.
+    The OpenAI key comes from OPENAI_API_KEY if set, otherwise from the Secrets Manager secret; it is only needed on a
+    cache miss.
     """
     sys.path.insert(0, os.path.join(ROOT, "serverless"))
     import package  # serverless/package.py; imported lazily because it pulls in the app's heavier dependencies
 
-    if package.index_is_stale() and not os.environ.get("OPENAI_API_KEY"):
-        os.environ["OPENAI_API_KEY"] = read_openai_key(boto3.client("secretsmanager", region_name=region), secret_name)
-    package.build_index()
+    if package.index_is_stale():
+        s3 = session.client("s3")
+        account = session.client("sts").get_caller_identity()["Account"]
+        bucket = artifact_bucket_name(account, session.region_name)
+        cache_key = f"{EMBEDDINGS_CACHE_PREFIX}{package.pdf_sha256()}.json"
+        if _download_if_exists(s3, bucket, cache_key, package.INDEX_PATH):
+            print(f"Reused cached embeddings s3://{bucket}/{cache_key}", file=sys.stderr)
+        else:
+            if not os.environ.get("OPENAI_API_KEY"):
+                os.environ["OPENAI_API_KEY"] = read_openai_key(session.client("secretsmanager"), secret_name)
+            package.build_index()
+            s3.upload_file(package.INDEX_PATH, bucket, cache_key)
+            print(f"Cached embeddings as s3://{bucket}/{cache_key}", file=sys.stderr)
     return package.build_zip(out_dir)
 
 
-def build(target_name, out_dir, secret_name=DEFAULT_SECRET_NAME, region=DEFAULT_REGION):
+def build(target_name, out_dir, session, secret_name=DEFAULT_SECRET_NAME):
     if target_name == "ec2":
         return build_ec2(out_dir)  # the instance embeds the resume itself at startup
-    return build_serverless(out_dir, secret_name, region)
+    return build_serverless(out_dir, session, secret_name)
+
+
+def audit_dependencies(work_dir):
+    """Fails on known vulnerabilities in the packages the Lambda ships; reports, without failing, those in the rest of
+    the lockfile (the Gradio/EC2 app and dev tools), which this pipeline does not deploy."""
+    sys.path.insert(0, os.path.join(ROOT, "serverless"))
+    import package
+
+    os.makedirs(work_dir, exist_ok=True)
+    everything = os.path.join(work_dir, "requirements-all.txt")
+    lambda_only = os.path.join(work_dir, "requirements-lambda.txt")
+    subprocess.run(["uv", "export", "--frozen", "--all-groups", "--no-hashes", "--no-emit-project",
+                    "--format", "requirements.txt", "--output-file", everything],
+                   cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
+    # Exactly what package.py installs into the zip: the runtime packages for Lambda's platform, pinned by uv.lock
+    subprocess.run(["uv", "pip", "compile", "-", "--quiet", "--no-header",
+                    "--python-version", package.LAMBDA_PYTHON, "--python-platform", package.LAMBDA_PLATFORM,
+                    "--constraint", everything, "--output-file", lambda_only],
+                   input="\n".join(package.RUNTIME_PACKAGES), text=True, cwd=ROOT, check=True)
+    audit = ["uvx", PIP_AUDIT, "--no-deps", "--disable-pip", "--progress-spinner", "off", "-r"]
+
+    print("Auditing what the Lambda ships (known vulnerabilities fail the build):", flush=True)
+    if subprocess.run(audit + [lambda_only]).returncode != 0:
+        raise RuntimeError("known vulnerabilities in the Lambda's dependencies (listed above); update them in uv.lock")
+    print("Auditing the rest of the lockfile (report only: the Gradio/EC2 app and dev tools aren't deployed here):",
+          flush=True)
+    if subprocess.run(audit + [everything]).returncode != 0:
+        print("WARNING: vulnerabilities outside the Lambda (listed above); fix them when an update is available")
 
 # ----------------------------------------------------
 # Artifacts and secrets
@@ -451,7 +505,10 @@ def deploy_pipeline(session, secret_name, waf=True, notification_email=None, con
 def deploy(session, target_name, stack_name, secret_name, waf=True, notification_email=None):
     target = TARGETS[target_name]
     ensure_openai_secret(session.client("secretsmanager"), secret_name)
-    zip_path = build(target_name, os.path.join(tempfile.gettempdir(), "digitaltwin-build"), secret_name, session.region_name)
+    account = session.client("sts").get_caller_identity()["Account"]
+    # Before building: the serverless build caches embeddings in this bucket
+    ensure_artifact_bucket(session.client("s3"), artifact_bucket_name(account, session.region_name), session.region_name)
+    zip_path = build(target_name, os.path.join(tempfile.gettempdir(), "digitaltwin-build"), session, secret_name)
     params = publish_code(session, target_name, zip_path)
     params["OpenAIApiKeySecretName"] = secret_name
     params["WebAclArn"] = deploy_waf(session, f"{stack_name}-waf", target.waf_post_rate) if waf else ""
@@ -513,6 +570,9 @@ def main(argv=None):
     p.add_argument("--stack-name", required=True)
     p.add_argument("--post-rate-limit", type=int, default=60)
 
+    p = sub.add_parser("audit", help="scan dependencies for known vulnerabilities")
+    p.add_argument("--work-dir", default=os.path.join(ROOT, "dist", "audit"))
+
     p = sub.add_parser("pipeline", help="bootstrap or update the CI/CD pipeline stack (serverless app)")
     p.add_argument("--secret-name", default=DEFAULT_SECRET_NAME)
     p.add_argument("--no-waf", action="store_true")
@@ -522,10 +582,13 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
     try:
-        if args.command == "build":
-            print(build(args.target, args.out_dir, args.secret_name, args.region))
+        if args.command == "audit":
+            audit_dependencies(args.work_dir)
             return 0
         session = boto3.Session(region_name=getattr(args, "region", DEFAULT_REGION))
+        if args.command == "build":
+            print(build(args.target, args.out_dir, session, args.secret_name))
+            return 0
         if args.command == "set-openai-key":
             key = prompt_openai_key().strip()
             check_key_format(key)

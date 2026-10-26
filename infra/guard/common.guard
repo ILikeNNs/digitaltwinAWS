@@ -1,0 +1,121 @@
+# Security baseline for every CloudFormation template in infra/ (checked by cfn-guard in the pipeline's build stage).
+
+let s3_buckets = Resources.*[ Type == 'AWS::S3::Bucket' ]
+rule s3_buckets_are_private_and_encrypted when %s3_buckets !empty {
+    %s3_buckets.Properties {
+        PublicAccessBlockConfiguration.BlockPublicAcls == true
+        PublicAccessBlockConfiguration.BlockPublicPolicy == true
+        PublicAccessBlockConfiguration.IgnorePublicAcls == true
+        PublicAccessBlockConfiguration.RestrictPublicBuckets == true
+        BucketEncryption exists
+        VersioningConfiguration.Status == 'Enabled'
+        <<
+            Violation: S3 buckets must block all public access, set encryption explicitly and keep versions
+        >>
+    }
+}
+
+let kms_keys = Resources.*[ Type == 'AWS::KMS::Key' ]
+rule kms_keys_rotate when %kms_keys !empty {
+    %kms_keys.Properties.EnableKeyRotation == true
+    <<
+        Violation: customer-managed KMS keys must have automatic rotation enabled
+    >>
+}
+
+let log_groups = Resources.*[ Type == 'AWS::Logs::LogGroup' ]
+rule log_groups_expire when %log_groups !empty {
+    %log_groups.Properties.RetentionInDays exists
+    <<
+        Violation: log groups must set RetentionInDays (logs may hold personal data and cost money forever)
+    >>
+}
+
+let dynamodb_tables = Resources.*[ Type == 'AWS::DynamoDB::Table' ]
+rule dynamodb_tables_encrypted_and_recoverable when %dynamodb_tables !empty {
+    %dynamodb_tables.Properties {
+        SSESpecification.SSEEnabled == true
+        PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled == true
+        <<
+            Violation: DynamoDB tables must be encrypted and have point-in-time recovery
+        >>
+    }
+}
+
+let sns_topics = Resources.*[ Type == 'AWS::SNS::Topic' ]
+rule sns_topics_encrypted when %sns_topics !empty {
+    %sns_topics.Properties.KmsMasterKeyId exists
+    <<
+        Violation: SNS topics must be KMS-encrypted (notifications carry contact details and pipeline metadata)
+    >>
+}
+
+let codebuild_projects = Resources.*[ Type == 'AWS::CodeBuild::Project' ]
+rule codebuild_projects_encrypted when %codebuild_projects !empty {
+    %codebuild_projects.Properties.EncryptionKey exists
+    <<
+        Violation: CodeBuild projects must encrypt artifacts with a customer-managed key
+    >>
+}
+
+let distributions = Resources.*[ Type == 'AWS::CloudFront::Distribution' ]
+rule cloudfront_https_only when %distributions !empty {
+    %distributions.Properties.DistributionConfig {
+        DefaultCacheBehavior.ViewerProtocolPolicy in ['redirect-to-https', 'https-only']
+        <<
+            Violation: CloudFront must never serve viewers over plain HTTP (default behavior)
+        >>
+        when CacheBehaviors exists {
+            CacheBehaviors[*].ViewerProtocolPolicy in ['redirect-to-https', 'https-only']
+            <<
+                Violation: CloudFront must never serve viewers over plain HTTP (cache behaviors)
+            >>
+        }
+    }
+}
+
+let security_groups = Resources.*[ Type == 'AWS::EC2::SecurityGroup' ]
+rule no_ingress_from_the_internet when %security_groups !empty {
+    %security_groups.Properties {
+        when SecurityGroupIngress exists {
+            SecurityGroupIngress[*] {
+                # Literal CIDRs only: a !Ref to a parameter can't be judged statically
+                when CidrIp is_string {
+                    CidrIp != '0.0.0.0/0'
+                    <<
+                        Violation: security groups must not accept IPv4 ingress from the whole internet
+                    >>
+                }
+                when CidrIpv6 is_string {
+                    CidrIpv6 != '::/0'
+                    <<
+                        Violation: security groups must not accept IPv6 ingress from the whole internet
+                    >>
+                }
+            }
+        }
+    }
+}
+
+# No inline policy statement may allow every action (that would be an admin grant hidden in a role)
+let roles = Resources.*[ Type == 'AWS::IAM::Role' ]
+rule iam_no_wildcard_actions when %roles !empty {
+    %roles.Properties {
+        when Policies exists {
+            Policies[*].PolicyDocument.Statement[ Effect == 'Allow' ] {
+                when Action is_string {
+                    Action != '*'
+                    <<
+                        Violation: IAM role policies must not allow Action "*"
+                    >>
+                }
+                when Action is_list {
+                    Action[*] != '*'
+                    <<
+                        Violation: IAM role policies must not allow Action "*"
+                    >>
+                }
+            }
+        }
+    }
+}
