@@ -1,0 +1,806 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CI/CD for the serverless digital twin — CodePipeline V2 (GitHub via CodeConnections) builds, tests and deploys
+  infra/serverless.yaml; every role is least-privilege and the CloudFormation deployment role can only create IAM roles
+  that carry a permissions boundary, so a compromised repository cannot escalate to account admin.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: "push to main -> Source (CodeConnections) -> Build (CodeBuild arm64 - tests, lint, build+upload Lambda zip, write params.json) -> Deploy (CloudFormation CREATE_UPDATE via CfnDeployRole) -> Publish (CodeBuild - site sync, CloudFront invalidation, smoke tests)"
+    must:
+      - single account, single region (eu-north-1); the WAF stack (us-east-1) is deployed by `deploy.py pipeline`, not by this pipeline
+      - deploy role may only create/modify IAM roles that carry WorkloadPermissionsBoundary (privilege-escalation guard)
+      - UseConnection is scoped to one repository; the connection itself reaches only repos granted in the GitHub app
+    ref: ../README.md
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Source }
+        Parameters: [ConnectionArn, FullRepositoryId, BranchName]
+      - Label: { default: Application stack }
+        Parameters: [AppStackName, CodeBucketName, OpenAIApiKeySecretName, WebAclArn, NotificationEmail, ReservedConcurrency]
+
+Parameters:
+  ConnectionArn:
+    Type: String
+    Description: AVAILABLE CodeConnections connection to GitHub (created once and approved in the console).
+    AllowedPattern: ^arn:aws:codeconnections:[a-z0-9-]+:\d{12}:connection/[0-9a-f-]+$
+  FullRepositoryId:
+    Type: String
+    Default: ILikeNNs/digitaltwinAWS
+    Description: owner/repo; the only repository the pipeline may read through the connection.
+  BranchName:
+    Type: String
+    Default: main
+  AppStackName:
+    Type: String
+    Default: digitaltwin-serverless
+    Description: Stack the pipeline deploys; IAM permissions are scoped to resources named after it.
+    AllowedPattern: ^[a-z][a-z0-9-]{2,40}$
+  CodeBucketName:
+    Type: String
+    Description: Existing versioned artifact bucket for Lambda packages (digitaltwin-artifacts-<account>-<region>).
+  OpenAIApiKeySecretName:
+    Type: String
+    Default: digitaltwin/openai-api-key
+  WebAclArn:
+    Type: String
+    Default: ""
+    Description: CLOUDFRONT-scoped WAF web ACL ARN (infra/waf.yaml in us-east-1); empty = no WAF.
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Contact requests, app alarms and pipeline failures go here; empty = no notifications.
+  ReservedConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 0
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- artifacts
+  ArtifactKey:
+    Type: AWS::KMS::Key
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: customer-managed key for pipeline artifacts and build logs (source code + build output); roles get access via IAM
+        must:
+          - keep the CloudWatch Logs statement; build log groups are encrypted with this key
+    Properties:
+      Description: Encrypts digital twin pipeline artifacts and build logs
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+          - Sid: BuildLogEncryption
+            Effect: Allow
+            Principal: { Service: !Sub "logs.${AWS::Region}.amazonaws.com" }
+            Action: [kms:Encrypt*, kms:Decrypt*, kms:ReEncrypt*, kms:GenerateDataKey*, kms:Describe*]
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-*"
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: CodePipeline artifact store; contents are disposable (expire after 30 days) but retained on stack deletion like all buckets here
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt ArtifactKey.Arn
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-artifacts
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration: { NoncurrentDays: 7 }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
+            Condition:
+              Bool: { aws:SecureTransport: "false" }
+
+  # ---------------------------------------------------------------- permissions boundary for app roles
+  WorkloadPermissionsBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: ceiling for every role the deploy role creates (Lambda + Pipe roles); the roles' own policies stay the precise grants
+        must:
+          - widen only together with infra/serverless.yaml role policies, or app roles silently lose permissions
+    Properties:
+      Description: Maximum permissions for IAM roles created by the digital twin pipeline
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AppRuntime
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+              - xray:GetSamplingRules
+              - xray:GetSamplingTargets
+              - xray:GetSamplingStatisticSummaries
+              - dynamodb:PutItem
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:DescribeStream
+              - dynamodb:GetRecords
+              - dynamodb:GetShardIterator
+              - dynamodb:ListStreams
+              - secretsmanager:GetSecretValue
+              - sns:Publish
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: "*"
+
+  # ---------------------------------------------------------------- CloudFormation deployment role
+  CfnDeployRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: CloudFormation assumes this to deploy the app stack; scoped to the resource types in serverless.yaml and to names starting with AppStackName where the service supports it
+        must:
+          - every iam:Create/Put/Attach on roles requires the WorkloadPermissionsBoundary condition
+          - extend when serverless.yaml gains a new resource type, or deployments fail with AccessDenied
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: deploy-app-stack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AppRolesOnlyWithBoundary
+                Effect: Allow
+                Action: [iam:CreateRole, iam:PutRolePolicy, iam:AttachRolePolicy, iam:PutRolePermissionsBoundary]
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-*"
+                Condition:
+                  StringEquals: { iam:PermissionsBoundary: !Ref WorkloadPermissionsBoundary }
+              - Sid: AppRolesManage
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:UpdateRole
+                  - iam:UpdateRoleDescription
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-*"
+              - Sid: PassAppRolesToTheirServices
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-*"
+                Condition:
+                  StringEquals: { iam:PassedToService: [lambda.amazonaws.com, pipes.amazonaws.com] }
+              - Sid: NeverRemoveTheBoundary
+                Effect: Deny
+                Action: iam:DeleteRolePermissionsBoundary
+                Resource: "*"
+              - Sid: DynamoDB
+                Effect: Allow
+                Action:
+                  - dynamodb:CreateTable
+                  - dynamodb:UpdateTable
+                  - dynamodb:DeleteTable
+                  - dynamodb:DescribeTable
+                  - dynamodb:DescribeTimeToLive
+                  - dynamodb:UpdateTimeToLive
+                  - dynamodb:DescribeContinuousBackups
+                  - dynamodb:UpdateContinuousBackups
+                  - dynamodb:TagResource
+                  - dynamodb:UntagResource
+                  - dynamodb:ListTagsOfResource
+                  - dynamodb:DescribeContributorInsights
+                  - dynamodb:DescribeKinesisStreamingDestination
+                  - dynamodb:GetResourcePolicy
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AppStackName}-*"
+              - Sid: Lambda
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:PutFunctionConcurrency
+                  - lambda:DeleteFunctionConcurrency
+                  - lambda:GetFunctionConcurrency
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:GetPolicy
+                  - lambda:CreateFunctionUrlConfig
+                  - lambda:UpdateFunctionUrlConfig
+                  - lambda:DeleteFunctionUrlConfig
+                  - lambda:GetFunctionUrlConfig
+                  - lambda:ListVersionsByFunction
+                  - lambda:GetRuntimeManagementConfig
+                  - lambda:GetFunctionCodeSigningConfig
+                  - lambda:GetFunctionRecursionConfig
+                  - lambda:GetFunctionScalingConfig
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:ListTags
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-*"
+              - Sid: LambdaWebAdapterLayer
+                Effect: Allow
+                Action: lambda:GetLayerVersion
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:753240598075:layer:LambdaAdapterLayerArm64:*"
+              - Sid: ReadLambdaPackages
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${CodeBucketName}/lambda/*"
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:DeleteRetentionPolicy
+                  - logs:PutMetricFilter
+                  - logs:DeleteMetricFilter
+                  - logs:DescribeMetricFilters
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:ListTagsForResource
+                  - logs:DescribeIndexPolicies
+                  - logs:GetDataProtectionPolicy
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AppStackName}-*"
+              - Sid: LogsDescribe
+                Effect: Allow
+                Action: [logs:DescribeLogGroups, logs:DescribeResourcePolicies]
+                Resource: "*"
+              - Sid: SiteBucket
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:ListBucket
+                  - s3:GetBucket*
+                  - s3:PutBucket*
+                  - s3:DeleteBucketPolicy
+                  - s3:GetEncryptionConfiguration
+                  - s3:PutEncryptionConfiguration
+                  - s3:GetLifecycleConfiguration
+                  - s3:PutLifecycleConfiguration
+                  - s3:GetAccelerateConfiguration
+                  - s3:GetAnalyticsConfiguration
+                  - s3:GetIntelligentTieringConfiguration
+                  - s3:GetInventoryConfiguration
+                  - s3:GetMetricsConfiguration
+                  - s3:GetReplicationConfiguration
+                  - s3:ListTagsForResource
+                  - s3:TagResource
+                  - s3:UntagResource
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${AppStackName}-sitebucket-*"
+              - Sid: CloudFront
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateDistribution
+                  - cloudfront:UpdateDistribution
+                  - cloudfront:DeleteDistribution
+                  - cloudfront:GetDistribution
+                  - cloudfront:GetDistributionConfig
+                  - cloudfront:TagResource
+                  - cloudfront:UntagResource
+                  - cloudfront:ListTagsForResource
+                  - cloudfront:CreateOriginAccessControl
+                  - cloudfront:UpdateOriginAccessControl
+                  - cloudfront:DeleteOriginAccessControl
+                  - cloudfront:GetOriginAccessControl
+                  - cloudfront:GetOriginAccessControlConfig
+                  - cloudfront:ListOriginAccessControls
+                  - cloudfront:CreateResponseHeadersPolicy
+                  - cloudfront:UpdateResponseHeadersPolicy
+                  - cloudfront:DeleteResponseHeadersPolicy
+                  - cloudfront:GetResponseHeadersPolicy
+                  - cloudfront:GetResponseHeadersPolicyConfig
+                  - cloudfront:ListResponseHeadersPolicies
+                  - cloudfront:GetCachePolicy
+                  - cloudfront:GetOriginRequestPolicy
+                # CloudFront resource IDs are random and untaggable at creation, so names can't scope these
+                Resource: "*"
+              - Sid: AttachWebAcl
+                Effect: Allow
+                Action: [wafv2:GetWebACL, wafv2:GetWebACLForResource]
+                Resource: !Sub "arn:${AWS::Partition}:wafv2:us-east-1:${AWS::AccountId}:global/webacl/*"
+              - Sid: Notifications
+                Effect: Allow
+                Action:
+                  - sns:CreateTopic
+                  - sns:DeleteTopic
+                  - sns:GetTopicAttributes
+                  - sns:SetTopicAttributes
+                  - sns:Subscribe
+                  - sns:Unsubscribe
+                  - sns:GetSubscriptionAttributes
+                  - sns:ListSubscriptionsByTopic
+                  - sns:TagResource
+                  - sns:UntagResource
+                  - sns:ListTagsForResource
+                  - sns:GetDataProtectionPolicy
+                  - sns:SetSubscriptionAttributes
+                Resource: !Sub "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${AppStackName}-*"
+              - Sid: TopicKeyCreate
+                Effect: Allow
+                Action: kms:CreateKey
+                # CreateKey has no resource to scope to
+                Resource: "*"
+              - Sid: TopicKeyManage
+                Effect: Allow
+                Action:
+                  - kms:DescribeKey
+                  - kms:GetKeyPolicy
+                  - kms:PutKeyPolicy
+                  - kms:EnableKeyRotation
+                  - kms:GetKeyRotationStatus
+                  - kms:ScheduleKeyDeletion
+                  - kms:TagResource
+                  - kms:UntagResource
+                  - kms:ListResourceTags
+                  - kms:EnableKey
+                  - kms:UpdateKeyDescription
+                Resource: !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+              - Sid: TableEncryption
+                Effect: Allow
+                Action: [kms:CreateGrant, kms:DescribeKey]
+                Resource: !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+                Condition:
+                  StringEquals: { kms:ViaService: !Sub "dynamodb.${AWS::Region}.amazonaws.com" }
+              - Sid: KmsAliasLookup
+                Effect: Allow
+                Action: kms:ListAliases
+                Resource: "*"
+              - Sid: Pipes
+                Effect: Allow
+                Action:
+                  - pipes:CreatePipe
+                  - pipes:UpdatePipe
+                  - pipes:DeletePipe
+                  - pipes:DescribePipe
+                  - pipes:StartPipe
+                  - pipes:StopPipe
+                  - pipes:TagResource
+                  - pipes:UntagResource
+                  - pipes:ListTagsForResource
+                Resource: !Sub "arn:${AWS::Partition}:pipes:${AWS::Region}:${AWS::AccountId}:pipe/${AppStackName}-*"
+              - Sid: PipeSourceStream
+                Effect: Allow
+                Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:ListStreams]
+                Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AppStackName}-*/stream/*"
+              - Sid: Alarms
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:TagResource
+                  - cloudwatch:UntagResource
+                  - cloudwatch:ListTagsForResource
+                Resource: !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AppStackName}-*"
+              - Sid: AlarmsDescribe
+                Effect: Allow
+                Action: cloudwatch:DescribeAlarms
+                Resource: "*"
+
+  # ---------------------------------------------------------------- CodeBuild
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/codebuild/${AWS::StackName}-build"
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt ArtifactKey.Arn
+
+  PublishLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/codebuild/${AWS::StackName}-publish"
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt ArtifactKey.Arn
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: tests + build + upload; cannot deploy, cannot change the code bucket's settings
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt BuildLogGroup.Arn
+              - Sid: PipelineArtifacts
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+              - Sid: ArtifactKey
+                Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey*]
+                Resource: !GetAtt ArtifactKey.Arn
+              - Sid: UploadLambdaPackages
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${CodeBucketName}/lambda/*"
+              - Sid: TellMissingFromForbidden
+                # Without ListBucket, HeadObject on a missing key returns 403 instead of 404
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${CodeBucketName}"
+                Condition:
+                  StringLike: { s3:prefix: ["lambda/*"] }
+              - Sid: OpenAIKeyForEmbedding
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${OpenAIApiKeySecretName}-??????"
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Description: Tests, lints and builds the serverless digital twin, uploads the Lambda package, writes params.json
+      ServiceRole: !GetAtt BuildRole.Arn
+      EncryptionKey: !GetAtt ArtifactKey.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/build.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-aarch64-standard:4.0
+        EnvironmentVariables:
+          - { Name: CODE_BUCKET, Value: !Ref CodeBucketName }
+          - { Name: OPENAI_SECRET_NAME, Value: !Ref OpenAIApiKeySecretName }
+      TimeoutInMinutes: 30
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+
+  PublishRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: post-deploy site sync, CloudFront invalidation and smoke tests; reads stack outputs, writes only the site bucket
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: publish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt PublishLogGroup.Arn
+              - Sid: PipelineArtifacts
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+              - Sid: ArtifactKey
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt ArtifactKey.Arn
+              - Sid: AppStackOutputs
+                Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*"
+              - Sid: SiteSync
+                Effect: Allow
+                Action: [s3:ListBucket, s3:PutObject, s3:DeleteObject]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${AppStackName}-sitebucket-*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${AppStackName}-sitebucket-*/*"
+              - Sid: Invalidate
+                Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/*"
+
+  PublishProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Description: Syncs the static UI, invalidates CloudFront and smoke-tests the deployed digital twin
+      ServiceRole: !GetAtt PublishRole.Arn
+      EncryptionKey: !GetAtt ArtifactKey.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/publish.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-aarch64-standard:4.0
+        EnvironmentVariables:
+          - { Name: APP_STACK_NAME, Value: !Ref AppStackName }
+      TimeoutInMinutes: 15
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref PublishLogGroup
+
+  # ---------------------------------------------------------------- pipeline
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: orchestration only; source limited to one repo + branch, deploys only AppStackName via CfnDeployRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SourceOneRepository
+                Effect: Allow
+                Action: codeconnections:UseConnection
+                Resource: !Ref ConnectionArn
+                Condition:
+                  StringEquals:
+                    codeconnections:FullRepositoryId: !Ref FullRepositoryId
+              - Sid: Artifacts
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketVersioning, s3:GetBucketLocation]
+                Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
+              - Sid: ArtifactKey
+                Effect: Allow
+                Action: [kms:Decrypt, kms:Encrypt, kms:GenerateDataKey*, kms:DescribeKey]
+                Resource: !GetAtt ArtifactKey.Arn
+              - Sid: Builds
+                Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds, codebuild:StopBuild]
+                Resource: [!GetAtt BuildProject.Arn, !GetAtt PublishProject.Arn]
+              - Sid: DeployAppStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*"
+              - Sid: ValidateTemplates
+                Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                # ValidateTemplate has no resource to scope to
+                Resource: "*"
+              - Sid: PassDeployRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnDeployRole.Arn
+                Condition:
+                  StringEquals: { iam:PassedToService: cloudformation.amazonaws.com }
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      PipelineType: V2
+      ExecutionMode: QUEUED
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+        EncryptionKey: { Id: !GetAtt ArtifactKey.Arn, Type: KMS }
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: Source
+            Push:
+              - Branches: { Includes: [!Ref BranchName] }
+                FilePaths: { Excludes: ["**/*.md", "screenshots/**"] }
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              Namespace: SourceVariables
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+              Configuration:
+                ConnectionArn: !Ref ConnectionArn
+                FullRepositoryId: !Ref FullRepositoryId
+                BranchName: !Ref BranchName
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts: [{ Name: SourceOutput }]
+        - Name: Build
+          Actions:
+            - Name: TestAndBuild
+              Namespace: BuildVariables
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: BuildOutput }]
+        - Name: Deploy
+          Actions:
+            - Name: DeployStack
+              Namespace: DeployVariables
+              ActionTypeId: { Category: Deploy, Owner: AWS, Provider: CloudFormation, Version: "1" }
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Ref AppStackName
+                Capabilities: CAPABILITY_IAM
+                RoleArn: !GetAtt CfnDeployRole.Arn
+                TemplatePath: BuildOutput::serverless.yaml
+                # Code location (CodeBucket/CodeKey/CodeVersionId) comes from the build; environment settings from here
+                TemplateConfiguration: BuildOutput::params.json
+                ParameterOverrides: !Sub
+                  - >-
+                    {"OpenAIApiKeySecretName": "${OpenAIApiKeySecretName}", "WebAclArn": "${WebAclArn}",
+                    "NotificationEmail": "${NotificationEmail}", "ReservedConcurrency": "${ReservedConcurrency}",
+                    "PermissionsBoundaryArn": "${Boundary}"}
+                  - Boundary: !Ref WorkloadPermissionsBoundary
+              InputArtifacts: [{ Name: BuildOutput }]
+        - Name: Publish
+          Actions:
+            - Name: SiteAndSmokeTest
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref PublishProject
+                EnvironmentVariables: '[{"name": "SITE_URL", "value": "#{DeployVariables.SiteUrl}", "type": "PLAINTEXT"}]'
+              InputArtifacts: [{ Name: SourceOutput }]
+
+  # ---------------------------------------------------------------- failure notifications (optional)
+  PipelineNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      DisplayName: Digital twin pipeline
+      KmsMasterKeyId: !Ref PipelineNotificationsKey
+
+  PipelineNotificationsKey:
+    Type: AWS::KMS::Key
+    Condition: HasNotificationEmail
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: EventBridge cannot publish to topics encrypted with the aws/sns managed key, so the topic gets its own key
+    Properties:
+      Description: Encrypts digital twin pipeline notifications
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+          - Sid: EventBridgePublish
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: [kms:Decrypt, kms:GenerateDataKey*]
+            Resource: "*"
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+
+  PipelineNotificationsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: HasNotificationEmail
+    Properties:
+      Topics: [!Ref PipelineNotificationsTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EventBridgePublish
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref PipelineNotificationsTopic
+            Condition:
+              ArnEquals: { aws:SourceArn: !GetAtt PipelineFailedRule.Arn }
+
+  PipelineNotificationsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref PipelineNotificationsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  PipelineFailedRule:
+    Type: AWS::Events::Rule
+    Condition: HasNotificationEmail
+    Properties:
+      Description: Emails when a digital twin pipeline execution fails
+      EventPattern:
+        source: [aws.codepipeline]
+        detail-type: [CodePipeline Pipeline Execution State Change]
+        detail:
+          pipeline: [!Ref Pipeline]
+          state: [FAILED]
+      Targets:
+        - Id: email
+          Arn: !Ref PipelineNotificationsTopic
+          InputTransformer:
+            InputPathsMap:
+              execution: $.detail.execution-id
+              pipeline: $.detail.pipeline
+            InputTemplate: >-
+              "Pipeline <pipeline> failed (execution <execution>). Open the CodePipeline console to see which stage failed."
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+  PipelineConsoleUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view?region=${AWS::Region}"
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  WorkloadPermissionsBoundaryArn:
+    Value: !Ref WorkloadPermissionsBoundary
+  CfnDeployRoleArn:
+    Value: !GetAtt CfnDeployRole.Arn

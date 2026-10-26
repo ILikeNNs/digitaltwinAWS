@@ -204,7 +204,7 @@ def test_deploy_stack_reports_failed_resources(deploy, tmp_path):
 
 
 def test_templates_fit_inline_limit(deploy):
-    for name in ("digitaltwin.yaml", "serverless.yaml", "waf.yaml"):
+    for name in ("digitaltwin.yaml", "serverless.yaml", "waf.yaml", "pipeline.yaml"):
         assert os.path.getsize(os.path.join(ROOT, "infra", name)) < deploy.INLINE_TEMPLATE_LIMIT
 
 # ======================= concurrency =======================
@@ -275,7 +275,11 @@ def test_publish_site_skips_invalidation_when_nothing_changed(deploy, tmp_path, 
 # ======================= CLI =======================
 
 def test_publish_writes_template_configuration(deploy, tmp_path, monkeypatch):
-    monkeypatch.setattr(deploy, "publish_code", lambda session, target, zip_path: {"CodeBucket": "b", "CodeKey": "k"})
+    def fake_publish_code(session, target, zip_path, ensure_bucket=True):
+        assert ensure_bucket is False  # CI's build role may not create or reconfigure the bucket
+        return {"CodeBucket": "b", "CodeKey": "k"}
+
+    monkeypatch.setattr(deploy, "publish_code", fake_publish_code)
     out = tmp_path / "params.json"
 
     assert deploy.main(["publish", "serverless", "--zip", "x.zip", "--params-out", str(out)]) == 0
@@ -364,3 +368,105 @@ def test_build_serverless_gets_key_only_when_needed(deploy, monkeypatch, tmp_pat
     assert ("secret" in calls) == expect_secret_read
     expected_key = "sk-secret" if expect_secret_read else env_key
     assert calls[-1] == ("build_index", expected_key)
+
+
+# ======================= pipeline bootstrap =======================
+
+def _connections(*items):
+    return {"Connections": [{"ConnectionName": n, "ConnectionStatus": st, "ConnectionArn": f"arn:{n}"} for n, st in items]}
+
+
+def test_find_connection_arn_requires_available_connection(deploy):
+    cc = _client("codeconnections")
+    with Stubber(cc) as stub:
+        stub.add_response("list_connections", _connections(("other", "AVAILABLE"), ("digitaltwin-github", "AVAILABLE")))
+        assert deploy.find_connection_arn(cc) == "arn:digitaltwin-github"
+        stub.add_response("list_connections", _connections(("digitaltwin-github", "PENDING")))
+        with pytest.raises(RuntimeError, match="PENDING.*console"):
+            deploy.find_connection_arn(cc)
+        stub.add_response("list_connections", _connections())
+        with pytest.raises(RuntimeError, match="no GitHub connection"):
+            deploy.find_connection_arn(cc)
+
+
+def test_deploy_pipeline_ensures_dependencies_and_passes_parameters(deploy, monkeypatch):
+    calls = []
+    sts = _client("sts")
+    monkeypatch.setattr(deploy, "ensure_artifact_bucket", lambda s3, bucket, region: calls.append(("bucket", bucket)))
+    monkeypatch.setattr(deploy, "ensure_openai_secret", lambda sm, name: calls.append(("secret", name)))
+    monkeypatch.setattr(deploy, "reserved_concurrency", lambda lam: 5)
+    monkeypatch.setattr(deploy, "deploy_waf", lambda session, stack, rate: calls.append(("waf", stack, rate)) or "arn:waf")
+    monkeypatch.setattr(deploy, "deploy_stack", lambda cfn, stack, template, params: calls.append(("stack", stack, params)) or {})
+
+    class Session:
+        region_name = "eu-north-1"
+
+        def client(self, service, **kwargs):
+            return sts if service == "sts" else None
+
+    with Stubber(sts) as stub:
+        stub.add_response("get_caller_identity", {"Account": "123456789012"})
+        deploy.deploy_pipeline(Session(), "my/secret", connection_arn="arn:conn")
+
+    assert calls[:3] == [("bucket", "digitaltwin-artifacts-123456789012-eu-north-1"), ("secret", "my/secret"),
+                         ("waf", "digitaltwin-serverless-waf", 30)]
+    _, stack, params = calls[3]
+    assert stack == "digitaltwin-pipeline"
+    assert params == {"ConnectionArn": "arn:conn", "AppStackName": "digitaltwin-serverless",
+                      "CodeBucketName": "digitaltwin-artifacts-123456789012-eu-north-1",
+                      "OpenAIApiKeySecretName": "my/secret", "ReservedConcurrency": 5, "WebAclArn": "arn:waf"}
+    assert "NotificationEmail" not in params  # omitted -> the stack keeps its current value
+
+# ======================= templates stay consistent =======================
+
+def _load_template(name):
+    import yaml
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    # Keep intrinsic functions as plain data: {"!Sub": [...]} etc.
+    Loader.add_multi_constructor("!", lambda loader, suffix, node: {"!" + suffix: (
+        loader.construct_sequence(node, deep=True) if isinstance(node, yaml.SequenceNode)
+        else loader.construct_mapping(node, deep=True) if isinstance(node, yaml.MappingNode)
+        else loader.construct_scalar(node))})
+    with open(os.path.join(ROOT, "infra", name), encoding="utf-8") as f:
+        return yaml.load(f, Loader=Loader)
+
+
+def _actions(statements):
+    for stmt in statements:
+        if stmt["Effect"] == "Allow":
+            yield from (stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]])
+
+
+# AWSXRayDaemonWriteAccess, attached to the chat function's role
+XRAY_MANAGED_ACTIONS = ["xray:PutTraceSegments", "xray:PutTelemetryRecords", "xray:GetSamplingRules",
+                        "xray:GetSamplingTargets", "xray:GetSamplingStatisticSummaries"]
+
+
+def test_permissions_boundary_covers_every_app_role_permission():
+    import fnmatch
+
+    pipeline, app = _load_template("pipeline.yaml"), _load_template("serverless.yaml")
+    boundary = list(_actions(pipeline["Resources"]["WorkloadPermissionsBoundary"]["Properties"]["PolicyDocument"]["Statement"]))
+    needed = list(XRAY_MANAGED_ACTIONS)
+    for name, resource in app["Resources"].items():
+        if resource["Type"] == "AWS::IAM::Role":
+            for policy in resource["Properties"].get("Policies", []):
+                needed += list(_actions(policy["PolicyDocument"]["Statement"]))
+    uncovered = [a for a in needed if not any(fnmatch.fnmatchcase(a.lower(), b.lower()) for b in boundary)]
+    assert not uncovered, f"app roles need actions outside WorkloadPermissionsBoundary: {uncovered}"
+
+
+def test_pipeline_parameter_overrides_match_the_app_template():
+    import re
+
+    pipeline, app = _load_template("pipeline.yaml"), _load_template("serverless.yaml")
+    deploy_action = next(a for stage in pipeline["Resources"]["Pipeline"]["Properties"]["Stages"]
+                         for a in stage["Actions"] if a["ActionTypeId"]["Provider"] == "CloudFormation")
+    template_text, _ = deploy_action["Configuration"]["ParameterOverrides"]["!Sub"]
+    overrides = json.loads(re.sub(r"\$\{([^}]+)\}", r"\1", template_text))  # ${Param} -> Param; the JSON's own braces stay
+    assert set(overrides) <= set(app["Parameters"]), "pipeline overrides parameters serverless.yaml doesn't declare"
+    assert "PermissionsBoundaryArn" in overrides  # the escalation guard only works if the pipeline always sets it
+    assert deploy_action["Configuration"]["TemplateConfiguration"] == "BuildOutput::params.json"

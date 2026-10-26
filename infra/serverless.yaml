@@ -63,11 +63,18 @@ Parameters:
     Default: 365
     MinValue: 1
     Description: Conversation logs expire via DynamoDB TTL after this many days. Contact requests never expire.
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional IAM permissions boundary for the roles this stack creates. The CI/CD pipeline always sets it
+      (infra/pipeline.yaml), so its deployment role can only create roles capped at what this app needs.
 
 Conditions:
   HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
   HasWebAcl: !Not [!Equals [!Ref WebAclArn, ""]]
   HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, ""]]
 
 Resources:
   # ---------------------------------------------------------------- data
@@ -119,6 +126,7 @@ Resources:
         must:
           - LeadingKeys/Select conditions are the contact-data confidentiality boundary; do not widen to plain GetItem/Query
     Properties:
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -465,6 +473,7 @@ Resources:
     Type: AWS::IAM::Role
     Condition: HasNotificationEmail
     Properties:
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

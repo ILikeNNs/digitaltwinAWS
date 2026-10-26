@@ -7,6 +7,7 @@
                             template configuration file (for a pipeline's CloudFormation deploy action)
   publish-site              sync serverless/web to the site bucket and invalidate CloudFront
   waf                       deploy the WAF web ACL stack (us-east-1) and print its ARN
+  pipeline                  bootstrap or update the CI/CD pipeline stack (infra/pipeline.yaml) for the serverless app
 
 Run with the deploy dependency group, e.g.:  uv run --group deploy python infra/deploy.py deploy serverless
 """
@@ -61,6 +62,9 @@ TARGETS = {
     "ec2": Target("digitaltwin", "digitaltwin.yaml", "digitaltwin/", 60),
     "serverless": Target("digitaltwin-serverless", "serverless.yaml", "lambda/", 30),
 }
+
+PIPELINE_STACK = "digitaltwin-pipeline"
+CONNECTION_NAME = "digitaltwin-github"
 
 
 def artifact_bucket_name(account, region):
@@ -393,19 +397,55 @@ def publish_site(session, stack_name):
 # End-to-end flows
 # ----------------------------------------------------
 
-def publish_code(session, target_name, zip_path):
-    """Uploads a built package and returns the stack parameters that point at it."""
+def publish_code(session, target_name, zip_path, ensure_bucket=True):
+    """Uploads a built package and returns the stack parameters that point at it.
+
+    ensure_bucket=False (CI): the build role may only write packages, not create or reconfigure the bucket.
+    """
     target = TARGETS[target_name]
     account = session.client("sts").get_caller_identity()["Account"]
     s3 = session.client("s3")
     bucket = artifact_bucket_name(account, session.region_name)
-    ensure_artifact_bucket(s3, bucket, session.region_name)
+    if ensure_bucket:
+        ensure_artifact_bucket(s3, bucket, session.region_name)
     key = target.key_prefix + os.path.basename(zip_path)
     artifact = publish_artifact(s3, bucket, key, zip_path)
     params = {"CodeBucket": bucket, "CodeKey": key, "CodeVersionId": artifact["VersionId"]}
     if target_name == "ec2":
         params["CodeSha256"] = artifact["Sha256"]
     return params
+
+
+def find_connection_arn(codeconnections, name=CONNECTION_NAME):
+    """The GitHub connection is created once and approved in the console; it must be AVAILABLE to be usable."""
+    for connection in codeconnections.list_connections(ProviderTypeFilter="GitHub", MaxResults=50)["Connections"]:
+        if connection["ConnectionName"] == name:
+            if connection["ConnectionStatus"] != "AVAILABLE":
+                raise RuntimeError(f"connection {name} is {connection['ConnectionStatus']}; finish the GitHub "
+                                   "authorization in the console (Developer Tools > Settings > Connections)")
+            return connection["ConnectionArn"]
+    raise RuntimeError(f"no GitHub connection named {name}; create it and approve it in the console first")
+
+
+def deploy_pipeline(session, secret_name, waf=True, notification_email=None, connection_arn=None):
+    """Bootstraps the CI/CD stack. Everything the pipeline relies on but does not own is ensured here first:
+    the code bucket, the OpenAI key secret and the WAF web ACL (us-east-1, outside the pipeline's region)."""
+    app = TARGETS["serverless"]
+    account = session.client("sts").get_caller_identity()["Account"]
+    bucket = artifact_bucket_name(account, session.region_name)
+    ensure_artifact_bucket(session.client("s3"), bucket, session.region_name)
+    ensure_openai_secret(session.client("secretsmanager"), secret_name)
+    params = {
+        "ConnectionArn": connection_arn or find_connection_arn(session.client("codeconnections")),
+        "AppStackName": app.stack_name,
+        "CodeBucketName": bucket,
+        "OpenAIApiKeySecretName": secret_name,
+        "ReservedConcurrency": reserved_concurrency(session.client("lambda")),
+        "WebAclArn": deploy_waf(session, f"{app.stack_name}-waf", app.waf_post_rate) if waf else "",
+    }
+    if notification_email is not None:  # omitted -> keep the current subscription
+        params["NotificationEmail"] = notification_email
+    return deploy_stack(session.client("cloudformation"), PIPELINE_STACK, os.path.join(INFRA, "pipeline.yaml"), params)
 
 
 def deploy(session, target_name, stack_name, secret_name, waf=True, notification_email=None):
@@ -473,6 +513,13 @@ def main(argv=None):
     p.add_argument("--stack-name", required=True)
     p.add_argument("--post-rate-limit", type=int, default=60)
 
+    p = sub.add_parser("pipeline", help="bootstrap or update the CI/CD pipeline stack (serverless app)")
+    p.add_argument("--secret-name", default=DEFAULT_SECRET_NAME)
+    p.add_argument("--no-waf", action="store_true")
+    p.add_argument("--notification-email", help="app alarms, contact requests and pipeline failures")
+    p.add_argument("--connection-arn", help=f"defaults to the AVAILABLE GitHub connection named {CONNECTION_NAME}")
+    add_region(p)
+
     args = parser.parse_args(argv)
     try:
         if args.command == "build":
@@ -492,12 +539,17 @@ def main(argv=None):
             stack_name = args.stack_name or TARGETS[args.target].stack_name
             deploy(session, args.target, stack_name, args.secret_name, not args.no_waf, args.notification_email)
         elif args.command == "publish":
-            params = publish_code(session, args.target, args.zip)
+            params = publish_code(session, args.target, args.zip, ensure_bucket=False)
             with open(args.params_out, "w", encoding="utf-8") as f:
                 json.dump({"Parameters": params}, f, indent=2)
             print(f"Wrote {args.params_out}")
         elif args.command == "publish-site":
             publish_site(session, args.stack_name)
+        elif args.command == "pipeline":
+            outputs = deploy_pipeline(session, args.secret_name, not args.no_waf, args.notification_email,
+                                      args.connection_arn)
+            for key, value in sorted(outputs.items()):
+                print(f"  {key}: {value}")
         elif args.command == "waf":
             print(deploy_waf(session, args.stack_name, args.post_rate_limit))
         return 0

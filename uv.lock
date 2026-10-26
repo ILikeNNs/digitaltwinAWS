@@ -1774,6 +1774,7 @@ deploy = [
 ]
 dev = [
     { name = "pytest" },
+    { name = "pyyaml" },
 ]
 
 [package.metadata]
@@ -1787,7 +1788,10 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 deploy = [{ name = "boto3", extras = ["crt"], specifier = ">=1.43.118" }]
-dev = [{ name = "pytest", specifier = ">=9.1.1" }]
+dev = [
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
+]
 
 [[package]]
 name = "numpy"
