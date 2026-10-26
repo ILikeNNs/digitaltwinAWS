@@ -634,3 +634,11 @@ def test_pipe_name_matches_the_deploy_roles_permissions():
     statements = pipeline["Resources"]["CfnDeployRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
     pipes = next(s for s in statements if s["Sid"] == "Pipes")
     assert pipes["Resource"]["!Sub"].endswith(":pipe/${AppStackName}-*")
+
+
+def test_markdown_only_pushes_do_not_trigger_the_pipeline():
+    # CodePipeline's "**/*.md" only matches Markdown inside a directory; a README-only push at the repo root
+    # triggered a full run until "*.md" was added.
+    pipeline = _load_template("pipeline.yaml")
+    push = pipeline["Resources"]["Pipeline"]["Properties"]["Triggers"][0]["GitConfiguration"]["Push"][0]
+    assert {"*.md", "**/*.md"} <= set(push["FilePaths"]["Excludes"])

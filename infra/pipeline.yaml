@@ -669,7 +669,7 @@ Resources:
             SourceActionName: Source
             Push:
               - Branches: { Includes: [!Ref BranchName] }
-                FilePaths: { Excludes: ["**/*.md", "screenshots/**"] }
+                FilePaths: { Excludes: ["*.md", "**/*.md", "screenshots/**"] }  # "**/" needs a directory level: root files need "*.md"
       Stages:
         - Name: Source
           Actions:
