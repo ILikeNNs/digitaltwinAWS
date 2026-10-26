@@ -22,6 +22,8 @@ Two CloudFormation deployments are provided. Both default to **eu-north-1 (Stock
 
 OpenAI usage is billed separately and isn't included in the AWS costs below. Before deploying either version, put a **budget/usage limit on the OpenAI project** whose key you use (OpenAI dashboard). It's the only control that caps OpenAI spend itself; everything below limits request rates.
 
+The `deploy*.ps1` scripts are thin wrappers around `infra/deploy.py`, which holds the build, upload and CloudFormation logic so it runs identically on your machine and on CodeBuild. It needs [uv](https://docs.astral.sh/uv/); on macOS/Linux call it directly, e.g. `uv run --group deploy python infra/deploy.py deploy serverless` (`--help` lists the steps the pipeline uses individually).
+
 #### Option 1: Gradio on EC2 (`infra/digitaltwin.yaml`)
 
 ```

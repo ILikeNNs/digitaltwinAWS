@@ -15,4 +15,5 @@ __pycache__/
 .pytest_cache/
 
 # Build outputs
+dist/
 *.zip

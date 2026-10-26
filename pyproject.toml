@@ -12,6 +12,9 @@ dependencies = [
 ]
 
 [dependency-groups]
+deploy = [
+    "boto3[crt]>=1.43.118",
+]
 dev = [
     "pytest>=9.1.1",
 ]
