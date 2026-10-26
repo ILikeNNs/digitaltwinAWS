@@ -566,7 +566,7 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:s3:::${AppStackName}-sitebucket-*/*"
               - Sid: Invalidate
                 Effect: Allow
-                Action: cloudfront:CreateInvalidation
+                Action: [cloudfront:CreateInvalidation, cloudfront:GetInvalidation]
                 Resource: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/*"
 
   PublishProject:
@@ -717,7 +717,6 @@ Resources:
               ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
               Configuration:
                 ProjectName: !Ref PublishProject
-                EnvironmentVariables: '[{"name": "SITE_URL", "value": "#{DeployVariables.SiteUrl}", "type": "PLAINTEXT"}]'
               InputArtifacts: [{ Name: SourceOutput }]
 
   # ---------------------------------------------------------------- failure notifications (optional)

@@ -1,0 +1,30 @@
+# Publish stage of the CI/CD pipeline (infra/pipeline.yaml, PublishProject), after CloudFormation has deployed.
+#
+#   1. Sync serverless/web to the site bucket, invalidate CloudFront and wait until the invalidation completes
+#   2. Smoke-test the live deployment (no OpenAI calls, so nothing is spent per deploy):
+#        - the site serves this commit's UI with the security headers
+#        - static assets are served
+#        - POST /api/chat with an empty message returns the app's 400: the full CloudFront -> Function URL path works
+#        - the Function URL refuses unsigned calls (403): nobody can bypass CloudFront and the WAF
+#
+# Only the "deploy" dependency group (boto3) is installed: this stage doesn't need the app's dependencies.
+
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    UV_VERSION: "0.13.5"
+    UV_NO_PROGRESS: "1"
+    # APP_STACK_NAME comes from the CodeBuild project; AWS_REGION is set by CodeBuild
+
+phases:
+  install:
+    commands:
+      - python3 -m pip install --quiet --disable-pip-version-check "uv==${UV_VERSION}"
+      - uv sync --frozen --only-group deploy
+
+  build:
+    commands:
+      - uv run --frozen --only-group deploy python infra/deploy.py publish-site --stack-name "${APP_STACK_NAME}" --region "${AWS_REGION}" --wait
+      - uv run --frozen --only-group deploy python infra/deploy.py smoke-test --stack-name "${APP_STACK_NAME}" --region "${AWS_REGION}"

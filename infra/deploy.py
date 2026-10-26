@@ -6,6 +6,7 @@
   publish {ec2,serverless}  upload a built zip and write the stack's code parameters as a CloudFormation
                             template configuration file (for a pipeline's CloudFormation deploy action)
   publish-site              sync serverless/web to the site bucket and invalidate CloudFront
+  smoke-test                check the live serverless deployment (no OpenAI calls)
   waf                       deploy the WAF web ACL stack (us-east-1) and print its ARN
   audit                     scan dependencies for known vulnerabilities (fails on what the Lambda ships)
   pipeline                  bootstrap or update the CI/CD pipeline stack (infra/pipeline.yaml) for the serverless app
@@ -21,6 +22,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import zipfile
 from dataclasses import dataclass
 
@@ -407,7 +410,7 @@ def reserved_concurrency(lambda_client, wanted=5):
 # Static site (serverless)
 # ----------------------------------------------------
 
-def publish_site(session, stack_name):
+def publish_site(session, stack_name, wait=False):
     """Syncs serverless/web to the site bucket (upload changed, delete removed) and invalidates CloudFront."""
     outputs = stack_outputs(session.client("cloudformation"), stack_name)
     bucket, distribution_id = outputs["SiteBucketName"], outputs["DistributionId"]
@@ -441,11 +444,98 @@ def publish_site(session, stack_name):
 
     print(f"Site {bucket}: {uploaded} uploaded, {len(stale)} deleted, {len(local) - uploaded} unchanged")
     if uploaded or stale:
-        session.client("cloudfront").create_invalidation(DistributionId=distribution_id, InvalidationBatch={
+        cloudfront = session.client("cloudfront")
+        invalidation = cloudfront.create_invalidation(DistributionId=distribution_id, InvalidationBatch={
             "Paths": {"Quantity": 1, "Items": ["/*"]},
             "CallerReference": f"deploy-{time.time_ns()}",
-        })
-        print(f"Invalidated CloudFront distribution {distribution_id}")
+        })["Invalidation"]
+        print(f"Invalidating CloudFront distribution {distribution_id}")
+        if wait:  # so smoke tests see the new files rather than edge caches
+            cloudfront.get_waiter("invalidation_completed").wait(
+                DistributionId=distribution_id, Id=invalidation["Id"], WaiterConfig={"Delay": 10, "MaxAttempts": 60})
+            print("Invalidation completed")
+
+# ----------------------------------------------------
+# Smoke tests (serverless, after a deploy) - no OpenAI calls, so they cost nothing to run on every deploy
+# ----------------------------------------------------
+
+def _http(url, method="GET", body=None, headers=None, timeout=30):
+    """Returns (status, headers, body) for any HTTP status, including 4xx/5xx."""
+    request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, response.headers, response.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+
+
+def _check_site(site_url):
+    status, headers, body = _http(site_url + "/")
+    if status != 200:
+        return f"GET / returned {status}"
+    with open(os.path.join(WEB_DIR, "index.html"), "rb") as f:
+        if body != f.read():
+            return "GET / does not serve this commit's serverless/web/index.html"
+    missing = [h for h in ("content-security-policy", "strict-transport-security", "x-content-type-options")
+               if not headers.get(h)]
+    if missing:
+        return f"GET / lacks security headers: {', '.join(missing)}"
+    return None
+
+
+def _check_asset(site_url):
+    status, _, _ = _http(site_url + "/app.js")
+    return None if status == 200 else f"GET /app.js returned {status}"
+
+
+def _check_api(site_url):
+    # An empty message is rejected by the app itself: proves CloudFront -> signed Function URL -> Web Adapter ->
+    # Starlette end to end without calling OpenAI. Lambda OAC needs the body hash, exactly like the browser sends.
+    body = json.dumps({"message": ""}).encode()
+    status, _, response = _http(site_url + "/api/chat", "POST", body, {
+        "content-type": "application/json", "x-amz-content-sha256": hashlib.sha256(body).hexdigest()})
+    if status != 400:
+        return f"POST /api/chat (empty message) returned {status}, expected 400: {response[:200]!r}"
+    if "error" not in json.loads(response):
+        return f"POST /api/chat returned 400 without the app's JSON error: {response[:200]!r}"
+    return None
+
+
+def _check_function_url_is_private(function_url):
+    # Unsigned calls straight to the Function URL must be refused, or callers could bypass CloudFront and the WAF
+    status, _, _ = _http(function_url.rstrip("/") + "/api/chat", "POST", b'{"message": "hi"}',
+                         {"content-type": "application/json"})
+    return None if status == 403 else f"direct Function URL call returned {status}, expected 403"
+
+
+def smoke_test(session, stack_name, deadline_seconds=300, retry_delay=10):
+    """Checks the live deployment; retries while a new deployment propagates through CloudFront."""
+    outputs = stack_outputs(session.client("cloudformation"), stack_name)
+    site_url = outputs["SiteUrl"].rstrip("/")
+    checks = [
+        ("site serves this commit's UI with security headers", lambda: _check_site(site_url), True),
+        ("static assets are served", lambda: _check_asset(site_url), True),
+        ("API answers through CloudFront (no OpenAI call)", lambda: _check_api(site_url), True),
+        ("Function URL refuses direct calls", lambda: _check_function_url_is_private(outputs["ChatFunctionUrl"]), False),
+    ]
+    failures = []
+    for name, check, retry in checks:
+        deadline = time.monotonic() + deadline_seconds
+        while True:
+            try:
+                problem = check()
+            except (urllib.error.URLError, TimeoutError, ValueError) as e:  # ValueError: response wasn't JSON
+                problem = f"{type(e).__name__}: {e}"
+            if problem is None or not retry or time.monotonic() >= deadline:
+                break
+            print(f"  ... {name}: {problem}; retrying in {retry_delay}s", flush=True)
+            time.sleep(retry_delay)
+        print(f"{'PASS' if problem is None else 'FAIL'}  {name}" + (f": {problem}" if problem else ""), flush=True)
+        if problem:
+            failures.append(name)
+    if failures:
+        raise RuntimeError(f"smoke tests failed: {', '.join(failures)}")
+    print(f"All smoke tests passed for {site_url}")
 
 # ----------------------------------------------------
 # End-to-end flows
@@ -564,6 +654,11 @@ def main(argv=None):
 
     p = sub.add_parser("publish-site", help="sync serverless/web and invalidate CloudFront")
     p.add_argument("--stack-name", default=TARGETS["serverless"].stack_name)
+    p.add_argument("--wait", action="store_true", help="wait until the invalidation has completed")
+    add_region(p)
+
+    p = sub.add_parser("smoke-test", help="check the live serverless deployment (no OpenAI calls)")
+    p.add_argument("--stack-name", default=TARGETS["serverless"].stack_name)
     add_region(p)
 
     p = sub.add_parser("waf", help="deploy the WAF stack in us-east-1 and print its ARN")
@@ -607,7 +702,9 @@ def main(argv=None):
                 json.dump({"Parameters": params}, f, indent=2)
             print(f"Wrote {args.params_out}")
         elif args.command == "publish-site":
-            publish_site(session, args.stack_name)
+            publish_site(session, args.stack_name, wait=args.wait)
+        elif args.command == "smoke-test":
+            smoke_test(session, args.stack_name)
         elif args.command == "pipeline":
             outputs = deploy_pipeline(session, args.secret_name, not args.no_waf, args.notification_email,
                                       args.connection_arn)

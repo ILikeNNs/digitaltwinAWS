@@ -631,6 +631,9 @@ Outputs:
     Value: !Ref Table
   ChatFunctionName:
     Value: !Ref ChatFunction
+  ChatFunctionUrl:
+    Description: Direct Function URL; refuses unsigned calls (only CloudFront via OAC may invoke it). Used by smoke tests.
+    Value: !GetAtt ChatFunctionUrl.FunctionUrl
   ContactRequestsQuery:
     Description: List contact requests, newest first
     Value: !Sub aws dynamodb query --table-name ${Table} --key-condition-expression "pk = :p" --expression-attribute-values '{":p":{"S":"CONTACT"}}' --no-scan-index-forward --region ${AWS::Region}

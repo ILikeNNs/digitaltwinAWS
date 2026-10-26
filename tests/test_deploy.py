@@ -228,6 +228,11 @@ class _Session:
         return self.clients[service]
 
 
+def _invalidation(status):
+    return {"Invalidation": {"Id": "I1", "Status": status, "CreateTime": "2026-01-01T00:00:00Z",
+                             "InvalidationBatch": {"Paths": {"Quantity": 1, "Items": ["/*"]}, "CallerReference": "r"}}}
+
+
 def test_publish_site_uploads_changed_deletes_removed_and_invalidates(deploy, tmp_path, monkeypatch):
     web = tmp_path / "web"
     web.mkdir()
@@ -249,10 +254,11 @@ def test_publish_site_uploads_changed_deletes_removed_and_invalidates(deploy, tm
             "Bucket": "site", "Key": "app.js", "Body": b"new js", "ContentType": "text/javascript; charset=utf-8"})
         s3_stub.add_response("delete_objects", {}, {
             "Bucket": "site", "Delete": {"Objects": [{"Key": "old.css"}], "Quiet": True}})
-        cf_stub.add_response("create_invalidation", {}, {"DistributionId": "D1", "InvalidationBatch": {
+        cf_stub.add_response("create_invalidation", _invalidation("InProgress"), {"DistributionId": "D1", "InvalidationBatch": {
             "Paths": {"Quantity": 1, "Items": ["/*"]}, "CallerReference": ANY}})
+        cf_stub.add_response("get_invalidation", _invalidation("Completed"), {"DistributionId": "D1", "Id": "I1"})
 
-        deploy.publish_site(_Session(cloudformation=cfn, s3=s3, cloudfront=cloudfront), "stack")
+        deploy.publish_site(_Session(cloudformation=cfn, s3=s3, cloudfront=cloudfront), "stack", wait=True)
         for stub in (cfn_stub, s3_stub, cf_stub):
             stub.assert_no_pending_responses()
 
@@ -531,3 +537,89 @@ def test_audit_blocks_only_on_lambda_vulnerabilities(deploy, monkeypatch, tmp_pa
     else:
         deploy.audit_dependencies(str(tmp_path))
         assert ("WARNING" in capsys.readouterr().out) == (outcome == "warn")
+
+
+# ======================= smoke tests =======================
+
+class _FakeSite:
+    """Answers deploy._http like the live deployment would, with knobs to break each part."""
+
+    def __init__(self, index_html, api_status=400, direct_status=403, stale_ui=False, api_failures_before_ok=0):
+        self.index_html, self.api_status, self.direct_status = index_html, api_status, direct_status
+        self.stale_ui, self.api_failures_left = stale_ui, api_failures_before_ok
+        self.requests = []
+
+    def __call__(self, url, method="GET", body=None, headers=None, timeout=30):
+        self.requests.append((method, url, dict(headers or {})))
+        security = {"content-security-policy": "default-src 'none'", "strict-transport-security": "max-age=1",
+                    "x-content-type-options": "nosniff"}
+        if url == "https://site.example/":
+            return 200, security, b"<old ui>" if self.stale_ui else self.index_html
+        if url == "https://site.example/app.js":
+            return 200, security, b"js"
+        if url == "https://site.example/api/chat":
+            assert headers["x-amz-content-sha256"] == hashlib.sha256(body).hexdigest()
+            if self.api_failures_left:
+                self.api_failures_left -= 1
+                return 503, {}, b"propagating"
+            return self.api_status, {}, b'{"error": "message must be non-empty"}'
+        if url == "https://fn.example/api/chat":
+            assert "x-amz-content-sha256" not in (headers or {})  # deliberately unsigned
+            return self.direct_status, {}, b'{"Message": "Forbidden"}'
+        raise AssertionError(f"unexpected request {url}")
+
+
+@pytest.fixture
+def live(deploy, monkeypatch):
+    with open(os.path.join(ROOT, "serverless", "web", "index.html"), "rb") as f:
+        index_html = f.read()
+    monkeypatch.setattr(deploy, "stack_outputs", lambda cfn, stack: {
+        "SiteUrl": "https://site.example", "ChatFunctionUrl": "https://fn.example/"})
+    monkeypatch.setattr(deploy.time, "sleep", lambda seconds: None)
+    session = _Session(cloudformation=None)
+
+    def run(**site_knobs):
+        site = _FakeSite(index_html, **site_knobs)
+        monkeypatch.setattr(deploy, "_http", site)
+        deploy.smoke_test(session, "stack", deadline_seconds=0.05, retry_delay=0)
+        return site
+    return run
+
+
+def test_smoke_test_passes_on_a_healthy_deployment(live):
+    site = live()
+    assert [m for m, _, _ in site.requests] == ["GET", "GET", "POST", "POST"]
+
+
+def test_smoke_test_waits_for_cloudfront_propagation(live):
+    site = live(api_failures_before_ok=2)
+    assert sum(1 for _, url, _ in site.requests if url.endswith("site.example/api/chat")) == 3
+
+
+@pytest.mark.parametrize("knobs, failing_check", [
+    ({"direct_status": 200}, "Function URL refuses direct calls"),
+    ({"stale_ui": True}, "site serves this commit's UI"),
+    ({"api_status": 502}, "API answers through CloudFront"),
+])
+def test_smoke_test_fails_on_a_broken_deployment(live, knobs, failing_check):
+    with pytest.raises(RuntimeError, match=f"smoke tests failed: .*{failing_check}"):
+        live(**knobs)
+
+
+# ======================= buildspecs =======================
+
+def test_buildspecs_only_use_existing_commands_and_files(deploy):
+    import re
+    import yaml
+
+    for name in ("build.yml", "publish.yml"):
+        with open(os.path.join(ROOT, "buildspecs", name), encoding="utf-8") as f:
+            spec = yaml.safe_load(f)
+        commands = [c for phase in spec["phases"].values() for c in phase["commands"]]
+        for command in commands:
+            for sub in re.findall(r"infra/deploy\.py (\S+)", command):
+                with pytest.raises(SystemExit) as exit_info:
+                    deploy.main([sub, "--help"])
+                assert exit_info.value.code == 0, f"{name}: deploy.py has no '{sub}' command"
+            for path in re.findall(r"(infra/\S+\.(?:yaml|guard)|serverless/\S+\.\w+)", command):
+                assert os.path.exists(os.path.join(ROOT, path)), f"{name} references missing {path}"
