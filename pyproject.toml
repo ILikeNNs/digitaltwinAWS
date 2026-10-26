@@ -1,0 +1,17 @@
+[project]
+name = "mydigitaltwin"
+version = "0.1.0"
+description = "RAG chatbot that answers questions about my resume"
+requires-python = ">=3.12"
+dependencies = [
+    "chromadb>=1.5.9",
+    "gradio>=6.30.0",
+    "openai>=3.36.1",
+    "pypdf>=6.21.2",
+    "python-dotenv>=1.2.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

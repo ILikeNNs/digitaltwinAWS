@@ -1,0 +1,9 @@
+# Normalize line endings in the repository; checkouts use the platform default
+* text=auto
+
+# Executed by bash on Lambda/Linux: must stay LF on every platform
+*.sh text eol=lf
+
+*.pdf binary
+*.png binary
+*.PNG binary

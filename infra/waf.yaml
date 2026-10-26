@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CloudFront web ACL for the digital twin (per-IP rate limiting + AWS managed protections) — separate stack because
+  WAF web ACLs with CLOUDFRONT scope can only be created in us-east-1, while the app stacks run in an EU region.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    must:
+      - deploy in us-east-1 only (Scope CLOUDFRONT)
+      - holds no data and no logs; only rules — data residency of the app stacks is unaffected
+    ref: ../README.md
+
+Parameters:
+  PostRateLimitPer5Min:
+    Type: Number
+    Default: 60
+    MinValue: 10
+    Description: >-
+      Max POST requests per client IP per 5 minutes before WAF blocks that IP. Every chat message is a POST
+      (serverless = 1 per message, Gradio = 2 per message), static assets are GETs and not counted.
+
+Resources:
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: per-IP rate limit is the main OpenAI denial-of-wallet control (API GW throttling is global, not per client); managed groups block known-bad IPs & exploit payloads
+        must:
+          - SizeRestrictions_BODY overridden to Count; both apps enforce their own length limits and Gradio bodies can exceed 8 KB
+        mutability:
+          Rules: change-with-constraints
+    Properties:
+      Name: !Sub "${AWS::StackName}"
+      Scope: CLOUDFRONT
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${AWS::StackName}"
+      Rules:
+        - Name: rate-limit-posts-per-ip
+          Priority: 0
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref PostRateLimitPer5Min
+              EvaluationWindowSec: 300
+              AggregateKeyType: IP
+              ScopeDownStatement:
+                ByteMatchStatement:
+                  FieldToMatch: { Method: {} }
+                  PositionalConstraint: EXACTLY
+                  SearchString: POST
+                  TextTransformations: [{ Priority: 0, Type: NONE }]
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: rate-limit-posts-per-ip
+        - Name: aws-ip-reputation
+          Priority: 1
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: aws-ip-reputation
+        - Name: aws-known-bad-inputs
+          Priority: 2
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: aws-known-bad-inputs
+        - Name: aws-common
+          Priority: 3
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              RuleActionOverrides:
+                - Name: SizeRestrictions_BODY
+                  ActionToUse: { Count: {} }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: aws-common
+
+Outputs:
+  WebAclArn:
+    Description: Pass to the app stacks' WebAclArn parameter
+    Value: !GetAtt WebAcl.Arn

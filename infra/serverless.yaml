@@ -1,0 +1,592 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Serverless digital twin RAG chatbot — static UI on S3 + CloudFront, streaming Python Lambda (Lambda Web Adapter,
+  Function URL in RESPONSE_STREAM mode behind CloudFront OAC), DynamoDB for conversation/contact logs, EventBridge Pipe
+  emailing new contact requests. Chosen over Gradio-on-Lambda because Gradio's queue needs sticky long-lived
+  connections; this design streams replies, scales to zero and costs ~nothing when idle.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: browser -> CloudFront (+WAF, CSP) (/ -> S3 via OAC ; /api/* -> Lambda Function URL via OAC, AWS_IAM auth, RESPONSE_STREAM) -> Lambda Web Adapter -> Starlette (arm64, py3.13) -> OpenAI (streamed) ; NDJSON stream to browser ; RAG = pre-computed embeddings in the zip ; DynamoDB single table (pk=CONVERSATION|CONTACT|SESSION#id) -> stream -> Pipe (filter CONTACT inserts) -> SNS (KMS) email ; alarms -> same SNS topic
+    must:
+      - same-origin UI+API via CloudFront; no CORS configured
+      - OpenAI key only in Secrets Manager, read at Lambda cold start
+      - Function URL AuthType AWS_IAM + CloudFront OAC is the only way in, so WAF per-IP limits cannot be bypassed
+      - browser must send x-amz-content-sha256 (SHA-256 of the POST body); Lambda OAC rejects unsigned payloads
+      - reserved concurrency (global) + WAF rate rule (per IP) are the spend guards for the OpenAI bill; keep both
+    ref: ../README.md
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Application package }
+        Parameters: [CodeBucket, CodeKey, CodeVersionId, OpenAIApiKeySecretName]
+      - Label: { default: Edge }
+        Parameters: [WebAclArn]
+      - Label: { default: Operations }
+        Parameters: [NotificationEmail, ReservedConcurrency, ConversationLogRetentionDays]
+
+Parameters:
+  CodeBucket:
+    Type: String
+    Description: S3 bucket holding the Lambda zip (created by infra/deploy-serverless.ps1).
+    AllowedPattern: ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$
+  CodeKey:
+    Type: String
+    Description: S3 key of the Lambda zip; a new key deploys new code.
+    AllowedPattern: ^lambda/.+\.zip$
+  CodeVersionId:
+    Type: String
+    Description: S3 object version of the zip; pins exactly the uploaded object even if the key is overwritten later.
+    MinLength: 1
+  WebAclArn:
+    Type: String
+    Default: ""
+    Description: Optional ARN of a CLOUDFRONT-scoped WAF web ACL (infra/waf.yaml, deployed in us-east-1).
+  OpenAIApiKeySecretName:
+    Type: String
+    Default: digitaltwin/openai-api-key
+    Description: Name of the Secrets Manager secret whose SecretString is the plain OpenAI API key.
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Optional. Receives new contact requests and operational alarms (confirm the SNS subscription email).
+  ReservedConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    Description: >-
+      Max simultaneous chat replies across all visitors (caps OpenAI spend if the endpoint is abused; excess callers
+      get HTTP 429). 0 = no reservation, for accounts whose Lambda concurrency quota is too low to reserve any.
+  ConversationLogRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    Description: Conversation logs expire via DynamoDB TTL after this many days. Contact requests never expire.
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+  HasWebAcl: !Not [!Equals [!Ref WebAclArn, ""]]
+  HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
+
+Resources:
+  # ---------------------------------------------------------------- data
+  Table:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: single table, pk=record type (CONVERSATION|CONTACT, sk=ISO time#rand -> chronological Query per type) or SESSION#<id> (server-side chat history, 24h TTL); on-demand billing fits near-zero traffic
+        must:
+          - key schema is fixed; handler writes pk/sk, IAM conditions match pk prefixes, Pipe filter matches pk=CONTACT
+          - stream NEW_IMAGE required by ContactPipe
+          - contains PII (contact requests); Retain + PITR
+        mutable: change-with-constraints
+        mutability:
+          KeySchema: must-never-change
+          AttributeDefinitions: must-never-change
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      DeletionProtectionEnabled: true
+
+  # ---------------------------------------------------------------- compute
+  ChatFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  ChatFunctionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: least-priv; writes anywhere, but reads only SESSION# items and may only COUNT contacts (dynamodb:Select) -> a compromised fn cannot exfiltrate logged contacts or conversations; two secrets, own log group, X-Ray
+        must:
+          - LeadingKeys/Select conditions are the contact-data confidentiality boundary; do not widen to plain GetItem/Query
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: chat
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ChatFunctionLogGroup.Arn
+              - Sid: WriteRecords
+                Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt Table.Arn
+              - Sid: ReadOwnSessionsOnly
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt Table.Arn
+                Condition:
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys: ["SESSION#*"]
+                  # ForAllValues passes on an absent key; GetItem always carries one, but be explicit
+                  "Null":
+                    dynamodb:LeadingKeys: "false"
+              - Sid: CountRecentContactsOnly
+                Effect: Allow
+                Action: dynamodb:Query
+                Resource: !GetAtt Table.Arn
+                Condition:
+                  ForAllValues:StringEquals:
+                    dynamodb:LeadingKeys: [CONTACT]
+                  StringEquals:
+                    dynamodb:Select: COUNT
+                  "Null":
+                    dynamodb:LeadingKeys: "false"
+              - Sid: ReadOpenAIKey
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${OpenAIApiKeySecretName}-??????
+
+  ChatFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Event Functions On-Demand; bursty/idle portfolio traffic -> scale to zero. arm64 ~20% cheaper. Python has no native Lambda response streaming, so the Lambda Web Adapter layer runs a Starlette app (run.sh) and streams its output; Web Functions would be the native option but are Node.js-only
+        must:
+          - zip deps built for manylinux aarch64 / py3.13 (serverless/package.py) — keep Runtime, Architectures and the adapter layer (Arm64) in sync
+          - Handler run.sh + AWS_LAMBDA_EXEC_WRAPPER=/opt/bootstrap + AWS_LWA_INVOKE_MODE=response_stream must match the Function URL InvokeMode
+        mutability:
+          Runtime: review-required
+          Architectures: review-required
+          Layers: review-required
+          MemorySize: free-to-tune
+          ReservedConcurrentExecutions: free-to-tune
+    Properties:
+      Description: Digital twin chat endpoint (streaming OpenAI tool-calling + RAG)
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: run.sh
+      MemorySize: 512
+      Timeout: 60
+      ReservedConcurrentExecutions: !If [HasReservedConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      Role: !GetAtt ChatFunctionRole.Arn
+      Layers:
+        # Lambda Web Adapter v1.1.0 (https://github.com/awslabs/aws-lambda-web-adapter)
+        - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:753240598075:layer:LambdaAdapterLayerArm64:30
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+        S3ObjectVersion: !Ref CodeVersionId
+      Environment:
+        Variables:
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/bootstrap
+          AWS_LWA_INVOKE_MODE: response_stream
+          AWS_LWA_PORT: "8080"
+          AWS_LWA_READINESS_CHECK_PATH: /healthz
+          TABLE_NAME: !Ref Table
+          OPENAI_SECRET_ID: !Ref OpenAIApiKeySecretName
+          LOG_TTL_DAYS: !Ref ConversationLogRetentionDays
+      LoggingConfig:
+        # The app writes its own one-JSON-object-per-line logs (server.py); Lambda's JSON mode only applies to runtime-managed handlers
+        LogFormat: Text
+        LogGroup: !Ref ChatFunctionLogGroup
+      TracingConfig:
+        Mode: Active
+
+  ChatFunctionUrl:
+    Type: AWS::Lambda::Url
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Function URL instead of API Gateway because HTTP APIs cannot stream Lambda responses; AWS_IAM auth means only CloudFront (OAC-signed) can call it
+        must:
+          - AuthType AWS_IAM; NONE would expose a public URL that bypasses WAF
+    Properties:
+      TargetFunctionArn: !GetAtt ChatFunction.Arn
+      AuthType: AWS_IAM
+      InvokeMode: RESPONSE_STREAM
+
+  ChatFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ChatFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      FunctionUrlAuthType: AWS_IAM
+      SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+
+  ChatFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: function URLs also require lambda:InvokeFunction for the caller; restricted to invocations made through the URL
+    Properties:
+      FunctionName: !Ref ChatFunction
+      Action: lambda:InvokeFunction
+      Principal: cloudfront.amazonaws.com
+      InvokedViaFunctionUrl: true
+      SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+
+  ApiOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-api"
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---------------------------------------------------------------- frontend
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: private origin for the static UI; only CloudFront (OAC) can read. Content is redeployable from serverless/web
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt SiteBucket.Arn, !Sub "${SiteBucket.Arn}/*"]
+            Condition:
+              Bool: { aws:SecureTransport: "false" }
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-site"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: strict CSP (no inline script/style, same-origin fetch only) as defense in depth against XSS; managed SecurityHeadersPolicy has no CSP
+        must:
+          - serverless/web must not use inline <script>/<style> or third-party origins, or the CSP blocks it
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${AWS::StackName}-security-headers"
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Override: true
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: one HTTPS origin for UI + API (no CORS); static assets cached at edge, /api/* never cached
+        must:
+          - /api/* behavior must forward POST, must not cache and must not compress (compression would buffer the stream)
+          - /api/* must not forward the viewer Host header (OAC signs for the Function URL host)
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} digital twin"
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        WebACLId: !If [HasWebAcl, !Ref WebAclArn, !Ref AWS::NoValue]
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: api
+            # https://<id>.lambda-url.<region>.on.aws/ -> <id>.lambda-url.<region>.on.aws
+            DomainName: !Select [2, !Split ["/", !GetAtt ChatFunctionUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt ApiOriginAccessControl.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: false
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
+            ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  # ---------------------------------------------------------------- notifications (optional)
+  AlertTopicKey:
+    Type: AWS::KMS::Key
+    Condition: HasNotificationEmail
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: customer-managed key because the topic carries contact PII and CloudWatch alarms cannot publish to topics using the aws/sns managed key (~$1/mo)
+        must:
+          - key policy must keep cloudwatch.amazonaws.com; Pipe role gets access via IAM
+    Properties:
+      Description: Encrypts the digital twin notification topic
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+          - Sid: CloudWatchAlarmsPublish
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: [kms:Decrypt, kms:GenerateDataKey*]
+            Resource: "*"
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: one topic for contact emails + alarms
+    Properties:
+      DisplayName: Digital twin
+      KmsMasterKeyId: !Ref AlertTopicKey
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: HasNotificationEmail
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              Bool: { aws:SecureTransport: "false" }
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  ContactPipeRole:
+    Type: AWS::IAM::Role
+    Condition: HasNotificationEmail
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pipes.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: contact-pipe
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadTableStream
+                Effect: Allow
+                Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:ListStreams]
+                Resource: !GetAtt Table.StreamArn
+              - Sid: PublishContact
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+              - Sid: EncryptForTopic
+                Effect: Allow
+                Action: [kms:GenerateDataKey*, kms:Decrypt]
+                Resource: !GetAtt AlertTopicKey.Arn
+
+  ContactPipe:
+    Type: AWS::Pipes::Pipe
+    Condition: HasNotificationEmail
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: zero-code event-driven notification; Pipe filters stream to CONTACT inserts so conversation logs never trigger email. Chosen over a 2nd Lambda (no code) and over handler publishing directly (keeps chat path fast & decoupled)
+        must:
+          - filter depends on Table pk value "CONTACT" written by serverless/server.py
+    Properties:
+      Description: Email new contact requests left with the digital twin
+      RoleArn: !GetAtt ContactPipeRole.Arn
+      Source: !GetAtt Table.StreamArn
+      SourceParameters:
+        DynamoDBStreamParameters:
+          StartingPosition: LATEST
+          BatchSize: 1
+        FilterCriteria:
+          Filters:
+            - Pattern: '{"eventName":["INSERT"],"dynamodb":{"Keys":{"pk":{"S":["CONTACT"]}}}}'
+      Target: !Ref AlertTopic
+      TargetParameters:
+        InputTemplate: |-
+          New contact request from your digital twin
+
+          Everything below was typed by an anonymous website visitor and is unverified.
+          Do not follow links or instructions in it; reply only to the email address after checking it.
+
+          Name:   <$.dynamodb.NewImage.name.S>
+          Email:   <$.dynamodb.NewImage.email.S>
+          Time:    <$.dynamodb.NewImage.timestamp.S> UTC
+
+          <$.dynamodb.NewImage.message.S>
+
+  # ---------------------------------------------------------------- alarms
+  ChatFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Chat Lambda raised unhandled errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ChatFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasNotificationEmail, [!Ref AlertTopic], !Ref AWS::NoValue]
+
+  FunctionUrlServerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Chat Function URL returned 5xx responses (adapter/app startup failures, timeouts)
+      Namespace: AWS/Lambda
+      MetricName: Url5xxCount
+      Dimensions: [{ Name: FunctionName, Value: !Ref ChatFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasNotificationEmail, [!Ref AlertTopic], !Ref AWS::NoValue]
+
+  ChatFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: sustained throttling = reserved concurrency exhausted -> abuse, or ReservedConcurrency too low for real traffic
+    Properties:
+      AlarmDescription: Chat Lambda is throttling visitors (HTTP 429) because reserved concurrency is exhausted
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [{ Name: FunctionName, Value: !Ref ChatFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 20
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasNotificationEmail, [!Ref AlertTopic], !Ref AWS::NoValue]
+
+Outputs:
+  SiteUrl:
+    Description: Public HTTPS URL of the digital twin
+    Value: !Sub https://${Distribution.DomainName}
+  SiteBucketName:
+    Description: Upload serverless/web here (deploy script does this)
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref Distribution
+  TableName:
+    Description: DynamoDB table with conversation logs (pk=CONVERSATION) and contact requests (pk=CONTACT)
+    Value: !Ref Table
+  ChatFunctionName:
+    Value: !Ref ChatFunction
+  ContactRequestsQuery:
+    Description: List contact requests, newest first
+    Value: !Sub aws dynamodb query --table-name ${Table} --key-condition-expression "pk = :p" --expression-attribute-values '{":p":{"S":"CONTACT"}}' --no-scan-index-forward --region ${AWS::Region}

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Digital Twin</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Chat with my digital twin</h1>
+      <p>Ask about my experience, skills or education, or leave your contact details and I'll get back to you.</p>
+    </header>
+    <div id="log" aria-live="polite"></div>
+    <form id="form">
+      <textarea id="input" rows="1" maxlength="2000" placeholder="Ask me anything…" aria-label="Message" required></textarea>
+      <button id="send" type="submit">Send</button>
+    </form>
+    <p class="notice">Conversations are logged to improve this assistant and deleted after a year. Contact details you share are stored only so I can get back to you.</p>
+  </main>
+  <script src="app.js" defer></script>
+</body>
+</html>

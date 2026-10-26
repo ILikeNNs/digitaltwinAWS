@@ -1,0 +1,39 @@
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #5d6673;
+  --border: #dde1e6; --accent: #2457d6; --accent-text: #ffffff; --bot: #eef1f5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111418; --panel: #191d23; --text: #e6e9ed; --muted: #9aa3ad;
+    --border: #2b313a; --accent: #6d95ff; --accent-text: #0b0f17; --bot: #222832;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  display: flex; justify-content: center; min-height: 100vh;
+}
+main { width: 100%; max-width: 760px; padding: 24px 16px; display: flex; flex-direction: column; height: 100vh; }
+header h1 { font-size: 1.25rem; margin: 0; }
+header p { margin: 4px 0 16px; color: var(--muted); font-size: 0.925rem; }
+#log {
+  flex: 1; overflow-y: auto; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 12px;
+}
+.msg { max-width: 85%; padding: 10px 14px; border-radius: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.user { align-self: flex-end; background: var(--accent); color: var(--accent-text); border-bottom-right-radius: 4px; }
+.assistant { align-self: flex-start; background: var(--bot); border-bottom-left-radius: 4px; }
+.pending { color: var(--muted); font-style: italic; }
+form { display: flex; gap: 8px; margin-top: 12px; }
+textarea {
+  flex: 1; resize: none; font: inherit; color: var(--text); background: var(--panel);
+  border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; min-height: 48px;
+}
+textarea:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button {
+  font: inherit; font-weight: 600; border: 0; border-radius: 10px; padding: 0 20px;
+  background: var(--accent); color: var(--accent-text); cursor: pointer;
+}
+button:disabled { opacity: 0.5; cursor: progress; }
+.notice { margin: 8px 0 0; color: var(--muted); font-size: 0.8rem; }

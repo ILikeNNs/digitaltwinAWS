@@ -1,0 +1,579 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Digital twin RAG chatbot (Gradio + OpenAI + Chroma + SQLite) on a single private EC2 instance behind CloudFront —
+  one instance because SQLite/Chroma are single-writer local stores; CloudFront reaches it through a VPC origin so
+  the instance has no public IP and app traffic never crosses the internet unencrypted.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: viewer -HTTPS-> CloudFront (+WAF) -VPC origin, HTTP:7860-> EC2 (private subnet, egress via NAT GW) ; app zip in S3 pinned by version id + sha256 -> cfn-init ; cfn-hup re-runs cfn-init on metadata change ; OPENAI key in Secrets Manager read at svc start ; SQLite+Chroma on separate EBS vol ; dnf-automatic security updates + weekly reboot-if-needed
+    must:
+      - single instance only; app rebuilds Chroma index at boot & SQLite is not multi-writer
+      - no secrets in parameters/metadata; key lives in Secrets Manager only
+      - instance stays in a private subnet; CloudFront VPC origin is the only ingress path
+    ref: ../README.md
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Application package }
+        Parameters: [CodeBucket, CodeKey, CodeVersionId, CodeSha256, OpenAIApiKeySecretName, UvVersion]
+      - Label: { default: Edge }
+        Parameters: [WebAclArn]
+      - Label: { default: Compute & network }
+        Parameters: [InstanceType, LatestAmiId, DataVolumeSizeGiB, VpcCidr, PublicSubnetCidr, PrivateSubnetCidr]
+
+Parameters:
+  CodeBucket:
+    Type: String
+    Description: S3 bucket holding the application zip (created by infra/deploy.ps1, versioning enabled).
+    AllowedPattern: ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$
+  CodeKey:
+    Type: String
+    Description: S3 key of the application zip. Must live under the digitaltwin/ prefix.
+    AllowedPattern: ^digitaltwin/.+\.zip$
+  CodeVersionId:
+    Type: String
+    Description: S3 object version of the zip; pins exactly the uploaded object even if the key is overwritten later.
+    MinLength: 1
+  CodeSha256:
+    Type: String
+    Description: SHA-256 of the zip; the instance refuses to install a package that does not match.
+    AllowedPattern: ^[a-f0-9]{64}$
+  OpenAIApiKeySecretName:
+    Type: String
+    Default: digitaltwin/openai-api-key
+    Description: Name of the Secrets Manager secret whose SecretString is the plain OpenAI API key.
+  UvVersion:
+    Type: String
+    Default: 0.13.5
+    Description: Exact uv release installed on the instance (must be able to read uv.lock).
+    AllowedPattern: ^\d+\.\d+\.\d+$
+  WebAclArn:
+    Type: String
+    Default: ""
+    Description: Optional ARN of a CLOUDFRONT-scoped WAF web ACL (infra/waf.yaml, deployed in us-east-1).
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    Description: EC2 instance type. Must match the architecture of LatestAmiId (t4g/m7g = arm64, t3/m7i = x86_64).
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Amazon Linux 2023 AMI (SSM public parameter).
+  DataVolumeSizeGiB:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 100
+    Description: Size of the EBS volume that stores conversation/contact logs and the Chroma index.
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.42.0.0/24
+    Description: Holds only the NAT gateway.
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.42.1.0/24
+    Description: Holds the app instance.
+
+Conditions:
+  HasWebAcl: !Not [!Equals [!Ref WebAclArn, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Metadata:
+      com.aws.cloudformation.Context:
+        must:
+          - required by NAT GW and by CloudFront VPC origins even though nothing public lives in the VPC
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-igw" }]
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public" }]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  NatElasticIp:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-nat" }]
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: managed egress for the private instance (OpenAI, PyPI, AWS APIs, dnf); chosen over a NAT instance (patching, SPOF) at ~$35/mo
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      AllocationId: !GetAtt NatElasticIp.AllocationId
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-nat" }]
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Metadata:
+      com.aws.cloudformation.Context:
+        must:
+          - same AZ as DataVolume; changing the AZ would replace the data volume
+        mutability:
+          AvailabilityZone: must-never-change
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-private" }]
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-private" }]
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: CloudFront VPC origin ENIs live inside this VPC, so ingress is limited to the VPC CIDR; no SSH (SSM Session Manager)
+        must:
+          - never open 7860 beyond the VPC
+        mutable: review-required
+    Properties:
+      GroupDescription: Gradio port reachable only from inside the VPC (CloudFront VPC origin)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: CloudFront VPC origin to Gradio
+          IpProtocol: tcp
+          FromPort: 7860
+          ToPort: 7860
+          CidrIp: !Ref VpcCidr
+      SecurityGroupEgress:
+        - Description: HTTPS out via NAT (OpenAI API, PyPI, uv Python download, AWS APIs)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - Description: HTTP out via NAT (dnf mirrors)
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # ---------------------------------------------------------------- IAM
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: least-priv; read app zips, read one secret, cfn-init/cfn-signal on this stack only; SSM core for shell access
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: !Sub "ec2.${AWS::URLSuffix}" }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: digitaltwin-app
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadAppPackages
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub arn:${AWS::Partition}:s3:::${CodeBucket}/digitaltwin/*
+              - Sid: ReadOpenAIKey
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${OpenAIApiKeySecretName}-??????
+              - Sid: CfnBootstrap
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:SignalResource
+                Resource: !Ref AWS::StackId
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ---------------------------------------------------------------- storage
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: holds conversation_logs.db (incl. recruiter contact requests) independently of the root volume so instance replacement keeps data
+        must:
+          - same AZ as PrivateSubnet
+          - Retain; contains user-submitted contact data
+        mutability:
+          AvailabilityZone: must-never-change
+    Properties:
+      AvailabilityZone: !GetAtt PrivateSubnet.AvailabilityZone
+      Size: !Ref DataVolumeSizeGiB
+      VolumeType: gp3
+      Encrypted: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-data" }]
+
+  # ---------------------------------------------------------------- compute
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 16
+              Encrypted: true
+              DeleteOnTermination: true
+
+  Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: [PrivateDefaultRoute, PrivateSubnetRouteTableAssociation]
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT25M
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: cfn-init installs uv + deps & systemd svc; cfn-hup polls metadata each minute so a new package redeploys w/o replacement
+        must:
+          - package is verified against CodeSha256 before it is unpacked as root
+          - data vol attached via Volumes prop (not VolumeAttachment) else CreationPolicy deadlocks
+          - must not reference Distribution (Distribution -> VpcOrigin -> Instance would cycle); Gradio derives its public URL from the forwarded Host + X-Forwarded-Proto
+          - DependsOn NAT route; bootstrap needs egress
+        mutability:
+          ImageId: review-required
+          InstanceType: review-required
+      AWS::CloudFormation::Init:
+        configSets:
+          default: [setup, app]
+          app: [app]
+        setup:
+          files:
+            /etc/dnf/vars/releasever:
+              mode: "000644"
+              owner: root
+              group: root
+              content: "latest\n"
+            /etc/dnf/automatic.conf:
+              mode: "000644"
+              owner: root
+              group: root
+              content: |
+                [commands]
+                upgrade_type = security
+                random_sleep = 0
+                download_updates = yes
+                apply_updates = yes
+
+                [emitters]
+                emit_via = stdio
+
+                [base]
+                debuglevel = 1
+            /etc/systemd/system/reboot-if-needed.service:
+              mode: "000644"
+              owner: root
+              group: root
+              content: |
+                [Unit]
+                Description=Reboot when installed updates (e.g. kernel) require it
+
+                [Service]
+                Type=oneshot
+                ExecStart=/bin/sh -c 'dnf needs-restarting -r || systemctl reboot'
+            /etc/systemd/system/reboot-if-needed.timer:
+              mode: "000644"
+              owner: root
+              group: root
+              content: |
+                [Unit]
+                Description=Weekly reboot window for security updates
+
+                [Timer]
+                OnCalendar=Sun *-*-* 03:30:00
+                Persistent=true
+
+                [Install]
+                WantedBy=timers.target
+          commands:
+            01_install_tools:
+              command: !Sub dnf install -y python3-pip unzip dnf-automatic dnf-plugins-core && pip3 install --quiet "uv==${UvVersion}"
+            02_create_user:
+              command: id digitaltwin || useradd --system --no-create-home --shell /sbin/nologin digitaltwin
+            03_data_dir_owner:
+              command: chown digitaltwin:digitaltwin /var/lib/digitaltwin && chmod 750 /var/lib/digitaltwin
+            04_security_updates:
+              command: systemctl daemon-reload && systemctl enable --now dnf-automatic.timer reboot-if-needed.timer
+        app:
+          files:
+            /etc/digitaltwin/app.env:
+              mode: "000640"
+              owner: root
+              group: digitaltwin
+              content: !Sub |
+                DATA_DIR=/var/lib/digitaltwin
+                HOME=/var/lib/digitaltwin
+                AWS_REGION=${AWS::Region}
+                OPENAI_SECRET_ID=${OpenAIApiKeySecretName}
+                GRADIO_SERVER_NAME=0.0.0.0
+                GRADIO_SERVER_PORT=7860
+                GRADIO_ANALYTICS_ENABLED=False
+                ANONYMIZED_TELEMETRY=False
+                PYTHONUNBUFFERED=1
+            /usr/local/bin/digitaltwin-start:
+              mode: "000755"
+              owner: root
+              group: root
+              content: |
+                #!/bin/bash
+                set -euo pipefail
+                OPENAI_API_KEY="$(aws secretsmanager get-secret-value --region "$AWS_REGION" --secret-id "$OPENAI_SECRET_ID" --query SecretString --output text)"
+                export OPENAI_API_KEY
+                cd "$DATA_DIR"
+                exec /opt/digitaltwin/.venv/bin/python /opt/digitaltwin/app.py
+            /etc/systemd/system/digitaltwin.service:
+              mode: "000644"
+              owner: root
+              group: root
+              content: |
+                [Unit]
+                Description=Digital twin Gradio app
+                After=network-online.target var-lib-digitaltwin.mount
+                Wants=network-online.target
+                RequiresMountsFor=/var/lib/digitaltwin
+
+                [Service]
+                User=digitaltwin
+                Group=digitaltwin
+                EnvironmentFile=/etc/digitaltwin/app.env
+                ExecStart=/usr/local/bin/digitaltwin-start
+                Restart=always
+                RestartSec=5
+                NoNewPrivileges=true
+                ProtectSystem=strict
+                ReadWritePaths=/var/lib/digitaltwin /tmp
+                PrivateTmp=true
+
+                [Install]
+                WantedBy=multi-user.target
+            /etc/cfn/cfn-hup.conf:
+              mode: "000400"
+              owner: root
+              group: root
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                interval=1
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              mode: "000400"
+              owner: root
+              group: root
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.Instance.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource Instance --configsets app --region ${AWS::Region}
+                runas=root
+            /etc/systemd/system/cfn-hup.service:
+              mode: "000644"
+              owner: root
+              group: root
+              content: |
+                [Unit]
+                Description=cfn-hup daemon
+
+                [Service]
+                Type=simple
+                ExecStart=/opt/aws/bin/cfn-hup
+                Restart=always
+
+                [Install]
+                WantedBy=multi-user.target
+          commands:
+            00_fetch_code:
+              command: !Sub |
+                set -euo pipefail
+                aws s3api get-object --region ${AWS::Region} --bucket ${CodeBucket} --key ${CodeKey} --version-id ${CodeVersionId} /tmp/digitaltwin.zip > /dev/null
+                echo "${CodeSha256}  /tmp/digitaltwin.zip" | sha256sum --check --strict -
+                mkdir -p /opt/digitaltwin
+                unzip -o -q /tmp/digitaltwin.zip -d /opt/digitaltwin
+                rm -f /tmp/digitaltwin.zip
+            01_uv_sync:
+              command: /usr/local/bin/uv sync --frozen --no-dev --python 3.12
+              cwd: /opt/digitaltwin
+              env:
+                HOME: /root
+                PATH: /usr/local/bin:/usr/bin:/bin
+                UV_PYTHON_INSTALL_DIR: /opt/uv/python
+                UV_CACHE_DIR: /var/cache/uv
+            02_restart_services:
+              command: systemctl daemon-reload && systemctl enable --now cfn-hup && systemctl enable digitaltwin && systemctl restart digitaltwin
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds: [!Ref AppSecurityGroup]
+      Volumes:
+        - Device: /dev/sdf
+          VolumeId: !Ref DataVolume
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-app" }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          signal() { /opt/aws/bin/cfn-signal -e "$1" --stack ${AWS::StackName} --resource Instance --region ${AWS::Region} || true; }
+          trap 'signal 1' ERR
+
+          dnf install -y aws-cfn-bootstrap
+
+          # Wait for the data volume (exposed as /dev/sdf by amazon-ec2-utils udev rules), format once, mount
+          for i in $(seq 1 150); do [ -e /dev/sdf ] && break; sleep 2; done
+          DEV=$(readlink -f /dev/sdf)
+          blkid "$DEV" || mkfs.xfs "$DEV"
+          UUID=$(blkid -s UUID -o value "$DEV")
+          mkdir -p /var/lib/digitaltwin
+          grep -q "$UUID" /etc/fstab || echo "UUID=$UUID /var/lib/digitaltwin xfs defaults,nofail 0 2" >> /etc/fstab
+          mount -a
+
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource Instance --configsets default --region ${AWS::Region}
+          signal 0
+
+  # ---------------------------------------------------------------- edge
+  VpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: CloudFront reaches the private instance over AWS's network; replaces public IP + prefix-list SG + plain HTTP over the internet
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: !Sub "${AWS::StackName}-app"
+        Arn: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}
+        HTTPPort: 7860
+        HTTPSPort: 443
+        OriginProtocolPolicy: http-only
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: free HTTPS on *.cloudfront.net w/o domain/cert; caching disabled since every Gradio req is dynamic (SSE + POST)
+        must:
+          - forward viewer Host (AllViewer policy) + static X-Forwarded-Proto=https so Gradio builds https://<cloudfront domain> URLs
+          - forward all methods; Gradio queue uses POST + SSE
+        mutable: change-with-constraints
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} digital twin"
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        WebACLId: !If [HasWebAcl, !Ref WebAclArn, !Ref AWS::NoValue]
+        Origins:
+          - Id: ec2-gradio
+            DomainName: !GetAtt Instance.PrivateDnsName
+            VpcOriginConfig:
+              VpcOriginId: !GetAtt VpcOrigin.Id
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+            OriginCustomHeaders:
+              - HeaderName: X-Forwarded-Proto
+                HeaderValue: https
+        DefaultCacheBehavior:
+          TargetOriginId: ec2-gradio
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: false
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3 # Managed-AllViewer
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # Managed-SecurityHeadersPolicy
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+Outputs:
+  AppUrl:
+    Description: Public HTTPS URL of the digital twin
+    Value: !Sub https://${Distribution.DomainName}
+  InstanceId:
+    Value: !Ref Instance
+  ShellAccess:
+    Description: Open a shell on the instance (requires the Session Manager plugin)
+    Value: !Sub aws ssm start-session --target ${Instance} --region ${AWS::Region}
+  LogsCommand:
+    Description: Run inside the SSM session to tail application logs
+    Value: sudo journalctl -u digitaltwin -f
+  DataVolumeId:
+    Description: Retained EBS volume with conversation/contact logs
+    Value: !Ref DataVolume
