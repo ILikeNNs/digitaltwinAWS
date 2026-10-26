@@ -10,8 +10,9 @@
     3. CloudFormation deploys the stack (plus the WAF stack in us-east-1 unless -NoWaf)
     4. serverless/web is synced to the site bucket and CloudFront is invalidated
 
-  First run only: creates the artifact bucket and the OPENAI_API_KEY secret (shared with the EC2 stack).
-  The OpenAI key is also needed locally (in .env) to embed the resume at build time.
+  First run only: creates the artifact bucket, and asks for the OpenAI key if it isn't stored yet (the secret is shared
+  with the EC2 stack; store or rotate it with: uv run --group deploy python infra/deploy.py set-openai-key).
+  Re-embedding the resume reads the key from that secret, so no .env file is needed.
 
   -NotificationEmail is remembered by the stack: omit it on later deploys to keep the current subscription.
 

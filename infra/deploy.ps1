@@ -7,8 +7,8 @@
   CodeBuild. Idempotent: unchanged code produces the same package and the stack update is a no-op; a changed
   package is picked up by cfn-hup on the instance within ~1 minute of the stack update.
 
-  First run only: creates the private, versioned artifact bucket and the Secrets Manager secret holding
-  OPENAI_API_KEY (read from .env, or prompted for).
+  First run only: creates the private, versioned artifact bucket, and asks for the OpenAI key if it isn't stored yet
+  (store or rotate it any time with: uv run --group deploy python infra/deploy.py set-openai-key).
 
 .EXAMPLE
   .\infra\deploy.ps1

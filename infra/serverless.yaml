@@ -573,6 +573,41 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: !If [HasNotificationEmail, [!Ref AlertTopic], !Ref AWS::NoValue]
 
+  OpenAIAuthFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: OpenAI auth failures (expired, revoked or wrong key) are caught and answered with a generic reply, so the Lambda never errors and ChatFunctionErrorsAlarm stays silent; this filter makes them visible
+        must:
+          - pattern must match the exact log message in serverless/server.py ("openai authentication failed")
+    Properties:
+      LogGroupName: !Ref ChatFunctionLogGroup
+      FilterPattern: '"openai authentication failed"'
+      MetricTransformations:
+        - MetricNamespace: !Sub "DigitalTwin/${AWS::StackName}"
+          MetricName: OpenAIAuthFailures
+          MetricValue: "1"
+          Unit: Count
+
+  OpenAIAuthFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: fires on the first failure; a bad stored key breaks every chat, so there is nothing to wait for
+    Properties:
+      AlarmDescription: >-
+        OpenAI rejected the stored API key (expired, revoked or wrong) and the chatbot is answering with an error.
+        Fix: uv run --group deploy python infra/deploy.py set-openai-key
+      Namespace: !Sub "DigitalTwin/${AWS::StackName}"
+      MetricName: OpenAIAuthFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasNotificationEmail, [!Ref AlertTopic], !Ref AWS::NoValue]
+
 Outputs:
   SiteUrl:
     Description: Public HTTPS URL of the digital twin

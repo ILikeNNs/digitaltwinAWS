@@ -1,5 +1,6 @@
 """Builds, publishes and deploys the digital twin, identically on a developer machine and on CodeBuild.
 
+  set-openai-key            store or rotate the OpenAI API key in Secrets Manager (hidden prompt, verified first)
   deploy {ec2,serverless}   everything end to end (what infra/deploy.ps1 / deploy-serverless.ps1 run)
   build {ec2,serverless}    build the package zip into --out-dir and print its path
   publish {ec2,serverless}  upload a built zip and write the stack's code parameters as a CloudFormation
@@ -22,7 +23,6 @@ from dataclasses import dataclass
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, WaiterError
-from dotenv import dotenv_values, load_dotenv
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INFRA = os.path.join(ROOT, "infra")
@@ -94,17 +94,25 @@ def build_ec2(out_dir):
     return path
 
 
-def build_serverless(out_dir):
-    """Embeds the resume if linkedin.pdf changed, then builds the arm64 Lambda zip (serverless/package.py)."""
-    load_dotenv(os.path.join(ROOT, ".env"))  # OPENAI_API_KEY for embedding; CodeBuild provides it as an env var
+def build_serverless(out_dir, secret_name=DEFAULT_SECRET_NAME, region=DEFAULT_REGION):
+    """Embeds the resume if linkedin.pdf changed, then builds the arm64 Lambda zip (serverless/package.py).
+
+    Embedding needs the OpenAI key: OPENAI_API_KEY when set (CodeBuild maps the secret to it), otherwise it is read
+    from the Secrets Manager secret, so no local .env file is needed. Unchanged resumes need no key at all.
+    """
     sys.path.insert(0, os.path.join(ROOT, "serverless"))
     import package  # serverless/package.py; imported lazily because it pulls in the app's heavier dependencies
 
+    if package.index_is_stale() and not os.environ.get("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = read_openai_key(boto3.client("secretsmanager", region_name=region), secret_name)
     package.build_index()
     return package.build_zip(out_dir)
 
 
-BUILDERS = {"ec2": build_ec2, "serverless": build_serverless}
+def build(target_name, out_dir, secret_name=DEFAULT_SECRET_NAME, region=DEFAULT_REGION):
+    if target_name == "ec2":
+        return build_ec2(out_dir)  # the instance embeds the resume itself at startup
+    return build_serverless(out_dir, secret_name, region)
 
 # ----------------------------------------------------
 # Artifacts and secrets
@@ -162,18 +170,75 @@ def publish_artifact(s3, bucket, key, path):
     return {"VersionId": response["VersionId"], "Sha256": sha256}
 
 
+# The Secrets Manager secret is the only place the OpenAI key is stored: both apps read it at runtime and the serverless
+# build reads it to embed the resume. set-openai-key creates it and rotates it.
+
+def read_openai_key(secretsmanager, name):
+    try:
+        return secretsmanager.get_secret_value(SecretId=name)["SecretString"]
+    except secretsmanager.exceptions.ResourceNotFoundException:
+        raise RuntimeError(f"Secret {name} not found; store the key first: "
+                           "uv run --group deploy python infra/deploy.py set-openai-key") from None
+
+
+def prompt_openai_key():
+    """Reads the key without echoing it, so it never lands in shell history, a command line or a file."""
+    if sys.stdin.isatty():
+        return getpass.getpass("OpenAI API key (input hidden): ")
+    return sys.stdin.readline()  # piped input, for automation
+
+
+def check_key_format(key):
+    if not key.startswith("sk-"):
+        raise RuntimeError("that doesn't look like an OpenAI API key (they start with 'sk-'); nothing was stored")
+
+
+def verify_openai_key(key):
+    """One tiny chat call and one embeddings call: proves the key works and has the two permissions the app uses."""
+    check_key_format(key)
+    import openai  # app dependency; imported here so the other commands don't need it
+    sys.path.insert(0, ROOT)
+    from helpers import MODEL
+    sys.path.insert(0, os.path.join(ROOT, "serverless"))
+    from retriever import EMBEDDING_MODEL
+
+    client = openai.OpenAI(api_key=key, max_retries=1)
+    try:
+        client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "ping"}], max_completion_tokens=16)
+        client.embeddings.create(model=EMBEDDING_MODEL, input="ping")
+    except openai.AuthenticationError:
+        raise RuntimeError("OpenAI rejected this key (mistyped, revoked or expired?); nothing was stored") from None
+    except openai.PermissionDeniedError as e:
+        raise RuntimeError("the key lacks a permission the app needs (Chat completions and Embeddings must be "
+                           f"Write): {e.message}; nothing was stored") from None
+    except openai.NotFoundError as e:
+        raise RuntimeError(f"the key's project cannot use a model the app needs: {e.message}; nothing was stored") from None
+
+
+def set_openai_key(secretsmanager, name, key):
+    """Creates the secret, or stores a new version of it when rotating; the apps pick it up without a redeploy."""
+    key = key.strip()
+    check_key_format(key)
+    try:
+        secretsmanager.put_secret_value(SecretId=name, SecretString=key)
+        print(f"Stored a new version of {name}")
+    except secretsmanager.exceptions.ResourceNotFoundException:
+        secretsmanager.create_secret(Name=name, SecretString=key,
+                                     Description="OpenAI API key for the digital twin (read at runtime by the app)")
+        print(f"Created {name}")
+
+
 def ensure_openai_secret(secretsmanager, name):
-    """Creates the secret holding OPENAI_API_KEY on first use (from the environment, .env, or a prompt)."""
+    """On a first deploy without a stored key, asks for it once (same as set-openai-key)."""
     try:
         secretsmanager.describe_secret(SecretId=name)
         return
     except secretsmanager.exceptions.ResourceNotFoundException:
         pass
-    key = (os.environ.get("OPENAI_API_KEY")
-           or dotenv_values(os.path.join(ROOT, ".env")).get("OPENAI_API_KEY")
-           or getpass.getpass("OPENAI_API_KEY: "))
-    print(f"Creating secret {name}")
-    secretsmanager.create_secret(Name=name, SecretString=key.strip())
+    print(f"No OpenAI key stored yet in {name}.")
+    key = prompt_openai_key()
+    verify_openai_key(key.strip())
+    set_openai_key(secretsmanager, name, key)
 
 # ----------------------------------------------------
 # CloudFormation
@@ -346,7 +411,7 @@ def publish_code(session, target_name, zip_path):
 def deploy(session, target_name, stack_name, secret_name, waf=True, notification_email=None):
     target = TARGETS[target_name]
     ensure_openai_secret(session.client("secretsmanager"), secret_name)
-    zip_path = BUILDERS[target_name](os.path.join(tempfile.gettempdir(), "digitaltwin-build"))
+    zip_path = build(target_name, os.path.join(tempfile.gettempdir(), "digitaltwin-build"), secret_name, session.region_name)
     params = publish_code(session, target_name, zip_path)
     params["OpenAIApiKeySecretName"] = secret_name
     params["WebAclArn"] = deploy_waf(session, f"{stack_name}-waf", target.waf_post_rate) if waf else ""
@@ -386,6 +451,13 @@ def main(argv=None):
     p = sub.add_parser("build", help="build the package zip and print its path")
     p.add_argument("target", choices=TARGETS)
     p.add_argument("--out-dir", default=os.path.join(ROOT, "dist"))
+    p.add_argument("--secret-name", default=DEFAULT_SECRET_NAME, help="serverless: key source when re-embedding")
+    add_region(p)
+
+    p = sub.add_parser("set-openai-key", help="store or rotate the OpenAI API key in Secrets Manager (prompts, hidden)")
+    p.add_argument("--secret-name", default=DEFAULT_SECRET_NAME)
+    p.add_argument("--skip-verify", action="store_true", help="store without the test calls to OpenAI")
+    add_region(p)
 
     p = sub.add_parser("publish", help="upload a built zip and write its stack parameters")
     p.add_argument("target", choices=TARGETS)
@@ -404,10 +476,19 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "build":
-            print(BUILDERS[args.target](args.out_dir))
+            print(build(args.target, args.out_dir, args.secret_name, args.region))
             return 0
         session = boto3.Session(region_name=getattr(args, "region", DEFAULT_REGION))
-        if args.command == "deploy":
+        if args.command == "set-openai-key":
+            key = prompt_openai_key().strip()
+            check_key_format(key)
+            if not args.skip_verify:
+                print("Checking the key with OpenAI...", flush=True)
+                verify_openai_key(key)
+            set_openai_key(session.client("secretsmanager"), args.secret_name, key)
+            print("Serverless picks the new key up automatically. EC2: restart the service "
+                  "(sudo systemctl restart digitaltwin, via SSM) or it keeps the old key until its next restart.")
+        elif args.command == "deploy":
             stack_name = args.stack_name or TARGETS[args.target].stack_name
             deploy(session, args.target, stack_name, args.secret_name, not args.no_waf, args.notification_email)
         elif args.command == "publish":

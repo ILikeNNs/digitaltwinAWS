@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 import boto3
 from boto3.dynamodb.conditions import Key
-from openai import OpenAI
+from openai import AuthenticationError, OpenAI
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
@@ -59,11 +59,41 @@ SESSION_TTL_HOURS = 24
 SESSION_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
-_openai_key = boto3.client("secretsmanager").get_secret_value(SecretId=os.environ["OPENAI_SECRET_ID"])["SecretString"]
+_secrets = boto3.client("secretsmanager")
+
+
+def _load_openai_key():
+    return _secrets.get_secret_value(SecretId=os.environ["OPENAI_SECRET_ID"])["SecretString"]
+
 
 # Created once per cold start (during Lambda init, before the adapter's readiness check passes) and reused
-client = OpenAI(api_key=_openai_key)
+client = OpenAI(api_key=_load_openai_key())
 rag = Retriever(client)
+
+
+def refresh_openai_key():
+    """Picks up a key rotated in Secrets Manager without a redeploy; True if the stored key differs from ours."""
+    global client
+    key = _load_openai_key()
+    if key == client.api_key:
+        return False
+    client = OpenAI(api_key=key)
+    rag.client = client
+    return True
+
+
+def stream_reply_refreshing_key(build_messages):
+    """stream_reply, retried once with a freshly loaded key if OpenAI rejects ours (rotated, revoked or expired).
+
+    `build_messages` returns a fresh message list, since stream_reply extends the one it is given.
+    """
+    try:
+        yield from stream_reply(client, build_messages(), handle_tool_calls)
+    except AuthenticationError:
+        if not refresh_openai_key():
+            raise
+        logger.warning("OpenAI rejected the key; reloaded a new one from Secrets Manager and retrying")
+        yield from stream_reply(client, build_messages(), handle_tool_calls)
 
 # ----------------------------------------------------
 # DynamoDB (single table)
@@ -170,12 +200,17 @@ def reply_stream(session_id, history, message):
         return
 
     history.append({"role": "user", "content": message})
-    messages = [{"role": "system", "content": SYSTEM_BASE_PROMPT}] + model_history(history)
     reply = ""
     try:
-        for fragment in stream_reply(client, messages, handle_tool_calls):
+        for fragment in stream_reply_refreshing_key(
+                lambda: [{"role": "system", "content": SYSTEM_BASE_PROMPT}] + model_history(history)):
             reply += fragment
             yield _line(delta=fragment)
+    except AuthenticationError:
+        # A distinct message so a CloudWatch metric filter can alarm on it: the stored key itself is bad
+        logger.exception("openai authentication failed", extra={"session": session_id})
+        reply = GENERIC_ERROR_REPLY
+        yield _line(delta=reply)
     except Exception:
         # Details go to CloudWatch, not to the (public) caller; keep what was already streamed
         logger.exception("chat failed", extra={"session": session_id})

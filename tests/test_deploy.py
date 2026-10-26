@@ -280,3 +280,87 @@ def test_publish_writes_template_configuration(deploy, tmp_path, monkeypatch):
 
     assert deploy.main(["publish", "serverless", "--zip", "x.zip", "--params-out", str(out)]) == 0
     assert json.loads(out.read_text()) == {"Parameters": {"CodeBucket": "b", "CodeKey": "k"}}
+
+# ======================= OpenAI key =======================
+
+def test_set_openai_key_rotates_existing_secret(deploy):
+    sm = _client("secretsmanager")
+    with Stubber(sm) as stub:
+        stub.add_response("put_secret_value", {}, {"SecretId": "s", "SecretString": "sk-new"})
+        deploy.set_openai_key(sm, "s", "  sk-new\n")
+        stub.assert_no_pending_responses()
+
+
+def test_set_openai_key_creates_missing_secret(deploy):
+    sm = _client("secretsmanager")
+    with Stubber(sm) as stub:
+        stub.add_client_error("put_secret_value", "ResourceNotFoundException")
+        stub.add_response("create_secret", {}, {"Name": "s", "SecretString": "sk-1", "Description": ANY})
+        deploy.set_openai_key(sm, "s", "sk-1")
+        stub.assert_no_pending_responses()
+
+
+def test_set_openai_key_rejects_non_keys_before_any_call(deploy):
+    sm = _client("secretsmanager")
+    with Stubber(sm):  # no responses queued: any AWS call would fail the test
+        with pytest.raises(RuntimeError, match="doesn't look like"):
+            deploy.set_openai_key(sm, "s", "my password")
+
+
+def test_read_openai_key_explains_missing_secret(deploy):
+    sm = _client("secretsmanager")
+    with Stubber(sm) as stub:
+        stub.add_client_error("get_secret_value", "ResourceNotFoundException")
+        with pytest.raises(RuntimeError, match="set-openai-key"):
+            deploy.read_openai_key(sm, "s")
+
+
+@pytest.mark.parametrize("error_name, message", [
+    ("AuthenticationError", "rejected this key"),
+    ("PermissionDeniedError", "lacks a permission"),
+    ("NotFoundError", "cannot use a model"),
+])
+def test_verify_openai_key_explains_failures(deploy, monkeypatch, error_name, message):
+    import httpx
+    import openai
+
+    def failing_create(**kwargs):
+        response = httpx.Response(401, request=httpx.Request("POST", "https://api.openai.com/v1/x"))
+        raise getattr(openai, error_name)("denied", response=response, body=None)
+
+    fake = type("FakeOpenAI", (), {})()
+    fake.chat = type("Chat", (), {"completions": type("C", (), {"create": staticmethod(failing_create)})()})()
+    fake.embeddings = type("E", (), {"create": staticmethod(failing_create)})()
+    monkeypatch.setattr(openai, "OpenAI", lambda **kwargs: fake)
+
+    with pytest.raises(RuntimeError, match=message):
+        deploy.verify_openai_key("sk-test")
+
+
+@pytest.mark.parametrize("stale, env_key, expect_secret_read", [
+    (True, None, True),        # re-embedding locally: key comes from Secrets Manager
+    (True, "sk-env", False),   # CodeBuild: secret already mapped to OPENAI_API_KEY
+    (False, None, False),      # resume unchanged: no key needed at all
+])
+def test_build_serverless_gets_key_only_when_needed(deploy, monkeypatch, tmp_path, stale, env_key, expect_secret_read):
+    import sys
+    import types
+
+    calls = []
+    fake_package = types.SimpleNamespace(
+        index_is_stale=lambda: stale,
+        build_index=lambda: calls.append(("build_index", os.environ.get("OPENAI_API_KEY"))),
+        build_zip=lambda out_dir: os.path.join(out_dir, "chat.zip"),
+    )
+    monkeypatch.setitem(sys.modules, "package", fake_package)
+    if env_key:
+        monkeypatch.setenv("OPENAI_API_KEY", env_key)
+    else:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(deploy, "read_openai_key", lambda sm, name: calls.append("secret") or "sk-secret")
+    monkeypatch.setattr(deploy.boto3, "client", lambda *a, **k: None)
+
+    assert deploy.build_serverless(str(tmp_path)) == os.path.join(str(tmp_path), "chat.zip")
+    assert ("secret" in calls) == expect_secret_read
+    expected_key = "sk-secret" if expect_secret_read else env_key
+    assert calls[-1] == ("build_index", expected_key)

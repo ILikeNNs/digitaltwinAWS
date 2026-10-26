@@ -47,14 +47,20 @@ def _sha256(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def build_index():
-    pdf_hash = _sha256(PDF_PATH)
-    if os.path.exists(INDEX_PATH):
-        with open(INDEX_PATH, encoding="utf-8") as f:
-            if json.load(f).get("pdf_sha256") == pdf_hash:
-                print("embeddings.json is up to date", file=sys.stderr)
-                return
+def index_is_stale():
+    """True when embeddings.json is missing or was built from a different linkedin.pdf (embedding needs the API key)."""
+    if not os.path.exists(INDEX_PATH):
+        return True
+    with open(INDEX_PATH, encoding="utf-8") as f:
+        return json.load(f).get("pdf_sha256") != _sha256(PDF_PATH)
 
+
+def build_index():
+    if not index_is_stale():
+        print("embeddings.json is up to date", file=sys.stderr)
+        return
+
+    pdf_hash = _sha256(PDF_PATH)
     reader = PdfReader(PDF_PATH)
     full_text = "".join([(page.extract_text() or "") + "\n" for page in reader.pages])
     chunks = RAGEngine._chunk_text(full_text)

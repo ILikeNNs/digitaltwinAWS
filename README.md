@@ -22,6 +22,14 @@ Two CloudFormation deployments are provided. Both default to **eu-north-1 (Stock
 
 OpenAI usage is billed separately and isn't included in the AWS costs below. Before deploying either version, put a **budget/usage limit on the OpenAI project** whose key you use (OpenAI dashboard). It's the only control that caps OpenAI spend itself; everything below limits request rates.
 
+**OpenAI key:** use a dedicated project key (service account, restricted to *Chat completions* and *Embeddings*). Store it once, in your own terminal:
+
+```powershell
+uv run --group deploy python infra/deploy.py set-openai-key
+```
+
+It prompts without echoing, checks the key with two tiny OpenAI calls, and stores it in the Secrets Manager secret `digitaltwin/openai-api-key`. That secret is the only place the key lives: both apps read it at runtime and the serverless build reads it to embed the resume, so no `.env` file is needed for deploying. Rotating is the same command with a new key, then revoking the old one in OpenAI. The serverless Lambda reloads the key automatically when OpenAI rejects the old one; on EC2, restart the service via SSM (`sudo systemctl restart digitaltwin`).
+
 The `deploy*.ps1` scripts are thin wrappers around `infra/deploy.py`, which holds the build, upload and CloudFormation logic so it runs identically on your machine and on CodeBuild. It needs [uv](https://docs.astral.sh/uv/); on macOS/Linux call it directly, e.g. `uv run --group deploy python infra/deploy.py deploy serverless` (`--help` lists the steps the pipeline uses individually).
 
 #### Option 1: Gradio on EC2 (`infra/digitaltwin.yaml`)
@@ -69,13 +77,13 @@ browser ─▶ CloudFront (+WAF, strict CSP) ─┬─ /        ─▶ S3 (priva
 | Notifications | A DynamoDB stream feeds an EventBridge Pipe that filters for new contact requests and emails them through a KMS-encrypted SNS topic, with a warning that the content is unverified visitor input. |
 | Streaming | The browser posts only its newest message and reads an NDJSON stream (`{"sessionId"}`, `{"delta"}`…, `{"done"}`). It also sends the body's SHA-256 in `x-amz-content-sha256`, which Lambda requires for POSTs signed by CloudFront's Origin Access Control. |
 | Security | The Function URL uses `AWS_IAM` auth and only CloudFront (Origin Access Control) may invoke it, so nothing can reach the Lambda without passing WAF. The Lambda can write records but may only read `SESSION#` items and only **count** contacts (IAM `dynamodb:LeadingKeys` + `dynamodb:Select` conditions), so it can't read stored contacts back. Strict CSP, private S3 origin, TLS everywhere. |
-| Observability | Structured JSON logs, X-Ray tracing, and alarms for Lambda errors, Function URL 5xx and sustained throttling. |
+| Observability | Structured JSON logs, X-Ray tracing, and alarms for Lambda errors, Function URL 5xx, sustained throttling, and OpenAI rejecting the stored key (an expired or revoked key otherwise only shows up as generic error replies). |
 
 ```powershell
 .\infra\deploy-serverless.ps1 -NotificationEmail you@example.com
 ```
 
-Requires `OPENAI_API_KEY` in `.env`, which is used to embed the resume at build time. The deploy script reserves 5 concurrent executions as a global cap. If the account's Lambda concurrency quota is too low to reserve any (new accounts can start at 10), it deploys without the cap and warns.
+When `linkedin.pdf` changes, the build re-embeds it using the key from the secret. The deploy script reserves 5 concurrent executions as a global cap. If the account's Lambda concurrency quota is too low to reserve any (new accounts can start at 10), it deploys without the cap and warns.
 
 Cost (eu-north-1 list prices, Oct 2026): about **$10.40/month** ($1.40 with `-NoWaf`), almost all of it the WAF ($9), the KMS key ($1, only with `-NotificationEmail`) and the OpenAI secret ($0.40). Usage-based charges stay under $1/month even at 50,000 messages, thanks to Lambda's always-free tier.
 
