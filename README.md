@@ -79,6 +79,8 @@ browser ─▶ CloudFront (+WAF, strict CSP) ─┬─ /        ─▶ S3 (priva
 | Security | The Function URL uses `AWS_IAM` auth and only CloudFront (Origin Access Control) may invoke it, so nothing can reach the Lambda without passing WAF. The Lambda can write records but may only read `SESSION#` items and only **count** contacts (IAM `dynamodb:LeadingKeys` + `dynamodb:Select` conditions), so it can't read stored contacts back. Strict CSP, private S3 origin, TLS everywhere. |
 | Observability | Structured JSON logs, X-Ray tracing, and alarms for Lambda errors, Function URL 5xx, sustained throttling, and OpenAI rejecting the stored key (an expired or revoked key otherwise only shows up as generic error replies). |
 
+In practice this version is deployed by the [CI/CD pipeline](#cicd-pipeline) on every push to `main`. The script below deploys it by hand, e.g. into another account or region:
+
 ```powershell
 .\infra\deploy-serverless.ps1 -NotificationEmail you@example.com
 ```
@@ -94,6 +96,8 @@ Cost (eu-north-1 list prices, Oct 2026): about **$10.40/month** ($1.40 with `-No
 .\infra\destroy.ps1                                     # EC2 stack and its WAF stack
 .\infra\destroy.ps1 -DeleteData -DeleteShared           # ...plus the data volume, OpenAI secret and artifact bucket
 ```
+
+**Remove the CI/CD pipeline first** if you've bootstrapped it; otherwise the next push to `main` redeploys the app you just destroyed. Delete the `digitaltwin-pipeline` stack (`aws cloudformation delete-stack --stack-name digitaltwin-pipeline`), then empty and delete its artifact bucket (`digitaltwin-pipeline-artifactbucket-*`), which is retained like every bucket here. The WAF stack belongs to the app, so `destroy-serverless.ps1` removes it.
 
 Both scripts list what they will delete and ask you to type the stack name first (`-Force` skips the prompt for automation). They delete the app stack before its WAF stack (CloudFront must release the web ACL first) and are safe to re-run after a partial failure.
 
@@ -112,3 +116,81 @@ Kept unless you ask: the **data** (DynamoDB table or EBS volume holding contact 
 | Gradio endpoints private (not part of the public Gradio API) | `app.py` |
 
 Both stacks share the versioned artifact bucket and the OpenAI secret, so they can run side by side. Deleting a stack keeps its data (the EBS volume or the DynamoDB table); delete those manually if you no longer need the logs.
+
+
+### CI/CD pipeline
+
+Every push to `main` tests, builds and deploys the serverless version. A run takes about 6 minutes; nothing is deployed unless every check passes. The pipeline itself is CloudFormation too (`infra/pipeline.yaml`).
+
+```
+git push ─▶ Source ─▶ Build ─────────────────────────────▶ Deploy ───────────────▶ Publish
+            GitHub    pytest, cfn-lint, cfn-guard,           CloudFormation          site sync, CloudFront
+            (Code-    pip-audit; build + upload the          (least-privilege        invalidation, smoke
+            Connec-   Lambda zip, write params.json          deploy role)            tests (no OpenAI calls)
+            tions)    [buildspecs/build.yml]                                         [buildspecs/publish.yml]
+```
+
+Commits that only touch `*.md` files or `screenshots/` don't trigger a run.
+
+#### Quality gates
+
+| Stage | Check | Fails the pipeline when |
+|---|---|---|
+| Build | `pytest` (app, Lambda server, deploy tooling, template consistency) | any test fails |
+| Build | `cfn-lint` on all four templates | a template is invalid |
+| Build | `cfn-guard` with `infra/guard/*.guard` | a security rule is broken: public or unencrypted buckets, unrotated keys, `Action: "*"`, internet-facing ingress, plain-HTTP CloudFront, a Function URL without IAM auth, a role without the permissions boundary, an unprotected contact table |
+| Build | `pip-audit` (`deploy.py audit`) | a package **the Lambda ships** has a known vulnerability. The rest of the lockfile (Gradio/EC2 app, dev tools) is reported but doesn't block, since this pipeline doesn't deploy it. |
+| Deploy | CloudFormation | the stack update fails; CloudFormation rolls back automatically |
+| Publish | Smoke tests (`deploy.py smoke-test`) | the site doesn't serve this commit's `index.html` with its security headers, static assets fail, `POST /api/chat` doesn't return the app's own 400 for an empty message, or the Function URL accepts an unsigned direct call |
+
+The Lambda package is reproducible: unchanged code produces the same content-hashed S3 key, so the Deploy stage is a no-op. Resume embeddings are cached in the artifact bucket under `linkedin.pdf`'s SHA-256, so the OpenAI embeddings API is only called when the PDF changes.
+
+#### Security model
+
+| Role | Can | Can't |
+|---|---|---|
+| Pipeline | read **only** `ILikeNNs/digitaltwinAWS` through the GitHub connection, start the two builds, deploy the app stack via the deploy role | read other repositories, touch other stacks |
+| Build | upload under `lambda/` and `embeddings/` in the artifact bucket, read the OpenAI key (only needed when re-embedding) | deploy anything, change bucket settings |
+| Publish | write the site bucket, invalidate CloudFront, read the app stack's outputs | change infrastructure |
+| CloudFormation deploy | create, update and delete exactly the resource types in `serverless.yaml`, scoped to `digitaltwin-serverless-*` names where AWS allows | create an IAM role **without** the `WorkloadPermissionsBoundary` |
+
+The last row is the privilege-escalation guard. A role that can create roles could otherwise create an admin role, so control of the repository would mean control of the account. Every role the pipeline creates must carry a permissions boundary that caps it at what the chatbot needs (DynamoDB, logs, X-Ray, one secret, SNS, KMS). Tests keep the boundary in sync with the app roles' permissions.
+
+Pipeline artifacts and build logs are encrypted with a customer-managed KMS key, artifacts expire after 30 days, and tool versions are pinned (the cfn-guard binary is verified by SHA-256).
+
+#### Bootstrap (once)
+
+Prerequisites: the GitHub connection `digitaltwin-github` approved in the console (Developer Tools → Settings → Connections), and the OpenAI key stored with `set-openai-key`. Then:
+
+```powershell
+uv run --group deploy python infra/deploy.py pipeline --notification-email you@example.com
+```
+
+This creates or updates, in order:
+1. the versioned artifact bucket and the OpenAI key secret, if missing;
+2. the WAF web ACL stack in us-east-1, since CloudFront web ACLs must live there and the pipeline only passes its ARN on;
+3. the pipeline stack (`digitaltwin-pipeline`), which starts its first run immediately.
+
+Confirm the SNS subscription emails to receive pipeline-failure, alarm and contact-request emails. Changes to `infra/pipeline.yaml` aren't deployed by the pipeline itself: re-run the command above after editing it.
+
+If the account's Lambda concurrency quota is below 105, the global cap of 5 simultaneous replies can't be reserved (Lambda keeps 100 unreserved). The bootstrap then deploys without it and warns. Request a quota increase in Service Quotas, then re-run the bootstrap.
+
+#### Day to day
+
+- **Deploy:** push to `main`. Pipeline failures are emailed to the notification address.
+- **Watch a run:** use the `PipelineConsoleUrl` output of the `digitaltwin-pipeline` stack. Build and publish logs are in CloudWatch Logs under `/aws/codebuild/digitaltwin-pipeline-*`.
+- **Roll back:** revert the commit and push (`git revert <sha> && git push`). This redeploys the previous code *and* site through every check. For an urgent rollback of the stack alone, CodePipeline can re-run the Deploy stage with an earlier successful execution's artifacts (`aws codepipeline rollback-stage`), but that leaves the site files as they are.
+- **Rotate the OpenAI key:** `uv run --group deploy python infra/deploy.py set-openai-key`. No deploy is needed; the Lambda picks the new key up when OpenAI rejects the old one.
+
+#### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Deploy fails with `... is not authorized to perform: <action>` | The deploy role lacks a permission a new or changed resource needs. Add the action to `CfnDeployRole` in `infra/pipeline.yaml` (scoped like its neighbours), re-run the bootstrap, then retry the stage. |
+| Stack stuck in `ROLLBACK_FAILED` / `DELETE_FAILED` | A resource couldn't be deleted during rollback. Run `delete-stack` once (it fails again, leaving the stack in `DELETE_FAILED`), then again with `--retain-resources <LogicalId>` for the resource that failed. Remove the failed attempt's leftovers by hand: retained tables and site buckets keep their `digitaltwin-serverless-` names. Then push or retry. |
+| Build fails in `pip-audit` | A dependency the Lambda ships has a published vulnerability. Update it (`uv lock --upgrade-package <name>`), commit, push. |
+| Publish fails a smoke test | The message names the failing check. A new CloudFront distribution can take a few minutes to propagate, so checks retry for up to 5 minutes before failing. |
+
+#### Cost
+
+About **$2.00–2.50/month** on top of the app, measured on the first runs (eu-north-1 list prices): two KMS keys ($1 each; the second only with a notification email), plus a few cents of CodeBuild (~1.2 build-minutes per deploy on arm64) and CodePipeline, which is free for the first pipeline and the first 100 action-minutes a month. So the serverless version costs about **$13/month** in total, before OpenAI usage.
