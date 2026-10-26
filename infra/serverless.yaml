@@ -508,7 +508,9 @@ Resources:
         why: zero-code event-driven notification; Pipe filters stream to CONTACT inserts so conversation logs never trigger email. Chosen over a 2nd Lambda (no code) and over handler publishing directly (keeps chat path fast & decoupled)
         must:
           - filter depends on Table pk value "CONTACT" written by serverless/server.py
+          - explicit Name with the stack prefix; CloudFormation's generated pipe names lack it (ContactPipe-<random>), which falls outside the pipeline deploy role's pipe/<stack>-* permissions
     Properties:
+      Name: !Sub "${AWS::StackName}-contacts"
       Description: Email new contact requests left with the digital twin
       RoleArn: !GetAtt ContactPipeRole.Arn
       Source: !GetAtt Table.StreamArn

@@ -623,3 +623,14 @@ def test_buildspecs_only_use_existing_commands_and_files(deploy):
                 assert exit_info.value.code == 0, f"{name}: deploy.py has no '{sub}' command"
             for path in re.findall(r"(infra/\S+\.(?:yaml|guard)|serverless/\S+\.\w+)", command):
                 assert os.path.exists(os.path.join(ROOT, path)), f"{name} references missing {path}"
+
+
+def test_pipe_name_matches_the_deploy_roles_permissions():
+    # CloudFormation names pipes "<LogicalId>-<random>" (no stack prefix), outside the deploy role's
+    # pipe/<AppStackName>-* permissions; the first pipeline run failed on exactly this. The name must stay prefixed.
+    app, pipeline = _load_template("serverless.yaml"), _load_template("pipeline.yaml")
+    pipe = next(r for r in app["Resources"].values() if r["Type"] == "AWS::Pipes::Pipe")
+    assert pipe["Properties"]["Name"] == {"!Sub": "${AWS::StackName}-contacts"}
+    statements = pipeline["Resources"]["CfnDeployRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+    pipes = next(s for s in statements if s["Sid"] == "Pipes")
+    assert pipes["Resource"]["!Sub"].endswith(":pipe/${AppStackName}-*")
