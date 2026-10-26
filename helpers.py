@@ -1,7 +1,10 @@
 import re
 from types import SimpleNamespace
 
-MODEL = "gpt-5.4-nano"
+MODEL = "gpt-6-luna"
+# gpt-6-luna rejects function tools in Chat Completions unless reasoning is off; answering from retrieved resume
+# context doesn't need it, and it keeps replies fast and cheap
+REASONING_EFFORT = "none"
 TEMPERATURE = 0.3
 # Upper bound on tool-call round trips per user message, so a looping model cannot burn tokens forever
 MAX_TOOL_ROUNDS = 5
@@ -102,7 +105,7 @@ def stream_reply(client, messages, handle_tool_calls):
     for tool_round in range(MAX_TOOL_ROUNDS + 1):
         stream = client.chat.completions.create(
             model=MODEL, messages=messages, tools=tools, tool_choice="auto", temperature=TEMPERATURE,
-            max_completion_tokens=MAX_COMPLETION_TOKENS, stream=True,
+            reasoning_effort=REASONING_EFFORT, max_completion_tokens=MAX_COMPLETION_TOKENS, stream=True,
         )
         calls = {}  # tool-call index -> {"id", "name", "arguments"}, filled from fragments spread over chunks
         finish_reason = None

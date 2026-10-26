@@ -461,3 +461,20 @@ def test_chat_stream_keeps_partial_reply_on_error(twin):
     history = module.chat(list(USER_HISTORY))
 
     assert history[-1]["content"] == f"Partial answer\n\n{module.GENERIC_ERROR_REPLY}"
+
+
+def test_every_model_call_disables_reasoning(twin):
+    # gpt-6-luna rejects function tools in Chat Completions unless reasoning_effort is "none" (HTTP 400),
+    # so every call of the tool loop must send it, including the follow-up calls after tool results
+    module, client = twin
+    module.rag.retrieve_context.return_value = "ctx"
+    client.chat.completions.create.side_effect = [
+        _completion(tool_calls=[_tool_call("query_resume", {"query": "experience"})]),
+        _completion("I worked on data platforms."),
+    ]
+
+    module.chat(list(USER_HISTORY))
+
+    calls = client.chat.completions.create.call_args_list
+    assert len(calls) == 2
+    assert all(c.kwargs["model"] == "gpt-6-luna" and c.kwargs["reasoning_effort"] == "none" for c in calls)

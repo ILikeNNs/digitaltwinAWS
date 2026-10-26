@@ -259,13 +259,14 @@ def verify_openai_key(key):
     check_key_format(key)
     import openai  # app dependency; imported here so the other commands don't need it
     sys.path.insert(0, ROOT)
-    from helpers import MODEL
+    from helpers import MODEL, REASONING_EFFORT
     sys.path.insert(0, os.path.join(ROOT, "serverless"))
     from retriever import EMBEDDING_MODEL
 
     client = openai.OpenAI(api_key=key, max_retries=1)
     try:
-        client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "ping"}], max_completion_tokens=16)
+        client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "ping"}],
+                                       reasoning_effort=REASONING_EFFORT, max_completion_tokens=16)
         client.embeddings.create(model=EMBEDDING_MODEL, input="ping")
     except openai.AuthenticationError:
         raise RuntimeError("OpenAI rejected this key (mistyped, revoked or expired?); nothing was stored") from None
