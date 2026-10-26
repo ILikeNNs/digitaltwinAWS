@@ -77,6 +77,18 @@ Requires `OPENAI_API_KEY` in `.env`, which is used to embed the resume at build 
 
 Cost (eu-north-1 list prices, Oct 2026): about **$10.40/month** ($1.40 with `-NoWaf`), almost all of it the WAF ($9), the KMS key ($1, only with `-NotificationEmail`) and the OpenAI secret ($0.40). Usage-based charges stay under $1/month even at 50,000 messages, thanks to Lambda's always-free tier.
 
+#### Tearing down
+
+```powershell
+.\infra\destroy-serverless.ps1                          # serverless stack, its site bucket and WAF stack
+.\infra\destroy.ps1                                     # EC2 stack and its WAF stack
+.\infra\destroy.ps1 -DeleteData -DeleteShared           # ...plus the data volume, OpenAI secret and artifact bucket
+```
+
+Both scripts list what they will delete and ask you to type the stack name first (`-Force` skips the prompt for automation). They delete the app stack before its WAF stack (CloudFront must release the web ACL first) and are safe to re-run after a partial failure.
+
+Kept unless you ask: the **data** (DynamoDB table or EBS volume holding contact requests) needs `-DeleteData`, and the **shared** OpenAI secret and artifact bucket need `-DeleteShared`. Even then, shared resources are only removed once neither app stack exists. The secret gets a 7-day recovery window (`aws secretsmanager restore-secret`).
+
 #### Abuse and cost guards (both versions)
 
 | Guard | Where |
