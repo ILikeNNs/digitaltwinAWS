@@ -396,8 +396,10 @@ Resources:
                 set -euo pipefail
                 OPENAI_API_KEY="$(aws secretsmanager get-secret-value --region "$AWS_REGION" --secret-id "$OPENAI_SECRET_ID" --query SecretString --output text)"
                 export OPENAI_API_KEY
+                # Run from the writable data dir (Gradio writes its cache to the cwd); the code is found via PYTHONPATH
                 cd "$DATA_DIR"
-                exec /opt/digitaltwin/.venv/bin/python /opt/digitaltwin/app.py
+                export PYTHONPATH=/opt/digitaltwin
+                exec /opt/digitaltwin/.venv/bin/python -m digitaltwin.app
             /etc/systemd/system/digitaltwin.service:
               mode: "000644"
               owner: root

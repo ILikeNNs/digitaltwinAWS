@@ -42,7 +42,8 @@ EMBEDDINGS_CACHE_PREFIX = "embeddings/"  # in the artifact bucket, keyed by link
 PIP_AUDIT = "pip-audit==2.10.1"
 INLINE_TEMPLATE_LIMIT = 51_200  # bytes CloudFormation accepts as TemplateBody
 
-EC2_APP_FILES = ["app.py", "database.py", "helpers.py", "rag_engine.py", "pyproject.toml", "uv.lock", "linkedin.pdf"]
+EC2_APP_FILES = ["digitaltwin/__init__.py", "digitaltwin/app.py", "digitaltwin/database.py", "digitaltwin/helpers.py",
+                 "digitaltwin/rag_engine.py", "pyproject.toml", "uv.lock", "linkedin.pdf"]
 # Fixed timestamps and permissions make the zip byte-for-byte reproducible: unchanged sources -> same key -> no redeploy
 ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 
@@ -259,7 +260,7 @@ def verify_openai_key(key):
     check_key_format(key)
     import openai  # app dependency; imported here so the other commands don't need it
     sys.path.insert(0, ROOT)
-    from helpers import MODEL, REASONING_EFFORT
+    from digitaltwin.helpers import MODEL, REASONING_EFFORT
     sys.path.insert(0, os.path.join(ROOT, "serverless"))
     from retriever import EMBEDDING_MODEL
 

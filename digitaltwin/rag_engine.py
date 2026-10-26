@@ -3,8 +3,10 @@ from pypdf import PdfReader
 import chromadb
 from chromadb.utils import embedding_functions
 
+from . import PROJECT_ROOT
+
 class RAGEngine:
-    def __init__(self, api_key, db_path=os.path.join(os.getenv("DATA_DIR") or os.path.dirname(os.path.abspath(__file__)), "chroma_db")):
+    def __init__(self, api_key, db_path=os.path.join(os.getenv("DATA_DIR") or PROJECT_ROOT, "chroma_db")):
         # Set up OpenAI embeddings
         self.embedding_fn = embedding_functions.OpenAIEmbeddingFunction(
             api_key=api_key,

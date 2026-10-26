@@ -29,7 +29,7 @@ from starlette.responses import JSONResponse, PlainTextResponse, StreamingRespon
 from starlette.routing import Route
 
 # Shared with the Gradio app: persona, model settings, tool schemas, limits, sanitizing and the streaming loop
-from helpers import (
+from digitaltwin.helpers import (
     SYSTEM_BASE_PROMPT, MAX_MESSAGE_LENGTH, MAX_SESSION_TURNS, MAX_CONTACTS_PER_HOUR,
     GENERIC_ERROR_REPLY, SESSION_LIMIT_REPLY, sanitize_input, is_valid_email, model_history, stream_reply,
 )

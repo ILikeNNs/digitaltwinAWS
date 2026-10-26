@@ -12,7 +12,7 @@ There are two tools used in the project:
 
 The project is modularized (as it should be):
 
-**The app (Gradio, runs locally and on EC2)**
+**The app (`digitaltwin/`, Gradio, runs locally and on EC2)**: run it with `uv run python -m digitaltwin.app`. Its data (`linkedin.pdf`, `conversation_logs.db`, `chroma_db/`) stays at the repository root.
 - **app.py** contains the Gradio web UI. Replies stream as they're generated, and the conversation is kept server-side, so visitors can't rewrite earlier turns.
 - **helpers.py** contains what both versions share: the persona prompt, model settings and spend limits, the tool definitions, input sanitizing, and the streaming tool-calling loop.
 - **database.py** contains the SQLite logging of conversations (deleted after a year) and contact requests (with an email check and an hourly cap).
@@ -78,7 +78,7 @@ Cost (eu-north-1 list prices, Oct 2026): t4g.small $12.56 + NAT Gateway $33.58 +
 
 #### Option 2: Serverless (`infra/serverless.yaml`)
 
-Gradio's queue needs long-lived connections that stay on one process, which Lambda can't provide. This version therefore swaps the Gradio UI for a small static chat page (`serverless/web/`) and shares the persona, model settings, tools, limits and the streaming tool-call loop with the Gradio app through `helpers.py`.
+Gradio's queue needs long-lived connections that stay on one process, which Lambda can't provide. This version therefore swaps the Gradio UI for a small static chat page (`serverless/web/`) and shares the persona, model settings, tools, limits and the streaming tool-call loop with the Gradio app through `digitaltwin/helpers.py`.
 
 Replies stream token by token. Python has no native Lambda response streaming, so `serverless/server.py` is a small Starlette app run by the **Lambda Web Adapter** layer (`serverless/run.sh`), exposed through a **Function URL in `RESPONSE_STREAM` mode**. API Gateway HTTP APIs can't stream Lambda responses, so there's no API Gateway.
 
@@ -131,10 +131,10 @@ Kept unless you ask: the **data** (DynamoDB table or EBS volume holding contact 
 | Per-IP rate limit on POSTs (60 per 5 min for Gradio, 30 for serverless), IP reputation and common-exploit rules | WAF (`infra/waf.yaml`) |
 | Global cap on simultaneous replies | Lambda reserved concurrency (serverless) |
 | Conversation history kept server-side; the browser can't inject `system`/`assistant` turns | `gr.State` / DynamoDB sessions |
-| Max 2,000 characters per message, 20 turns sent to the model, 30 user turns per session, 1,000 completion tokens per call | `helpers.py` |
-| Contact tool: email format check and at most 10 requests per hour globally | `database.py` / `serverless/server.py` |
-| Generic error replies (details only in server logs); logging failures never break the chat | `app.py` / `serverless/server.py` |
-| Gradio endpoints private (not part of the public Gradio API) | `app.py` |
+| Max 2,000 characters per message, 20 turns sent to the model, 30 user turns per session, 1,000 completion tokens per call | `digitaltwin/helpers.py` |
+| Contact tool: email format check and at most 10 requests per hour globally | `digitaltwin/database.py` / `serverless/server.py` |
+| Generic error replies (details only in server logs); logging failures never break the chat | `digitaltwin/app.py` / `serverless/server.py` |
+| Gradio endpoints private (not part of the public Gradio API) | `digitaltwin/app.py` |
 
 Both stacks share the versioned artifact bucket and the OpenAI secret, so they can run side by side. Deleting a stack keeps its data (the EBS volume or the DynamoDB table); delete those manually if you no longer need the logs.
 

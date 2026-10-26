@@ -4,13 +4,14 @@ from contextlib import closing
 from datetime import datetime, timedelta
 
 # sanitize_input lives in helpers so the serverless handler shares it; re-exported here for existing callers
-from helpers import sanitize_input, is_valid_email, MAX_CONTACTS_PER_HOUR, LOG_RETENTION_DAYS
+from . import PROJECT_ROOT
+from .helpers import sanitize_input, is_valid_email, MAX_CONTACTS_PER_HOUR, LOG_RETENTION_DAYS
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-# Stored in DATA_DIR when set (e.g. a mounted volume on AWS), otherwise next to this script
+# Stored in DATA_DIR when set (e.g. a mounted volume on AWS), otherwise at the repository root
 # so the same log file is used regardless of working directory
-SQL_DB_FILE = os.path.join(os.getenv("DATA_DIR") or os.path.dirname(os.path.abspath(__file__)), "conversation_logs.db")
+SQL_DB_FILE = os.path.join(os.getenv("DATA_DIR") or PROJECT_ROOT, "conversation_logs.db")
 
 def _connect():
     """Opens a connection that is always closed (closing) and committed or rolled back (inner with)."""

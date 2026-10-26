@@ -3,11 +3,12 @@ import json
 import gradio as gr
 from openai import OpenAI
 # Import modular layers
-from database import init_sql_db, log_conversation, log_contact_request
-from rag_engine import RAGEngine
+from . import PROJECT_ROOT
+from .database import init_sql_db, log_conversation, log_contact_request
+from .rag_engine import RAGEngine
 from dotenv import load_dotenv
 # Persona and model settings live in helpers so the serverless deployment shares them
-from helpers import (
+from .helpers import (
     tools, SYSTEM_BASE_PROMPT, MODEL, TEMPERATURE, MAX_TOOL_ROUNDS, MAX_COMPLETION_TOKENS,
     MAX_MESSAGE_LENGTH, MAX_SESSION_TURNS, LOG_RETENTION_DAYS, GENERIC_ERROR_REPLY, SESSION_LIMIT_REPLY,
     sanitize_input, model_history, stream_reply,
@@ -18,7 +19,7 @@ load_dotenv(override=True)
 api_key = os.getenv('OPENAI_API_KEY')
 buildchroma = True
 
-PDF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "linkedin.pdf")
+PDF_PATH = os.path.join(PROJECT_ROOT, "linkedin.pdf")
 
 # Initialize OpenAI Client (Make sure OPENAI_API_KEY is in your environment)
 client = OpenAI()

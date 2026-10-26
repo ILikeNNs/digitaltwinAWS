@@ -27,9 +27,12 @@ def _rows(database, sql):
         conn.close()
 
 
-def test_default_db_path_is_next_to_the_script(load_module):
+def test_default_db_path_is_the_repository_root(load_module, monkeypatch):
+    # The app lives in digitaltwin/, but its log database stays at the repository root (where it always was)
+    monkeypatch.delenv("DATA_DIR", raising=False)
     module = load_module(PROJECT, "database")
-    assert os.path.dirname(module.SQL_DB_FILE) == os.path.dirname(os.path.abspath(module.__file__))
+    package_dir = os.path.dirname(os.path.abspath(module.__file__))
+    assert os.path.dirname(module.SQL_DB_FILE) == os.path.dirname(package_dir)
 
 
 def test_init_is_idempotent(database):
@@ -173,11 +176,12 @@ def test_chunk_rejects_invalid_parameters(rag, chunk_size, overlap):
         rag._chunk_text(_words(10), chunk_size=chunk_size, overlap=overlap)
 
 
-def test_default_db_path_is_next_to_the_script(rag_module):
+def test_default_chroma_path_is_the_repository_root(rag_module):
     rag_module.chromadb.PersistentClient.reset_mock()
     rag_module.RAGEngine(api_key="k")
     path = rag_module.chromadb.PersistentClient.call_args.kwargs["path"]
-    assert path == os.path.join(os.path.dirname(os.path.abspath(rag_module.__file__)), "chroma_db")
+    package_dir = os.path.dirname(os.path.abspath(rag_module.__file__))
+    assert path == os.path.join(os.path.dirname(package_dir), "chroma_db")
 
 
 @pytest.mark.parametrize("query_result", [{"documents": []}, {"documents": [[]]}, {}])
@@ -263,10 +267,12 @@ def _tool_call(name, args, call_id="call_1"):
 USER_HISTORY = [{"role": "user", "content": "What did you build?", "metadata": {"ignored": True}}]
 
 
-def test_startup_indexes_pdf_from_script_directory(twin):
+def test_startup_indexes_the_resume_at_the_repository_root(twin):
     module, _ = twin
     module.rag.index_pdf.assert_called_once_with(module.PDF_PATH)
-    assert os.path.dirname(module.PDF_PATH) == os.path.dirname(os.path.abspath(module.__file__))
+    package_dir = os.path.dirname(os.path.abspath(module.__file__))
+    assert os.path.dirname(module.PDF_PATH) == os.path.dirname(package_dir)
+    assert os.path.isfile(module.PDF_PATH)  # a wrong path would otherwise only print a warning at startup
 
 
 def test_chat_plain_answer(twin):

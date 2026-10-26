@@ -25,7 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
-from rag_engine import RAGEngine  # noqa: E402  (reuse the exact chunking used by the Gradio app)
+from digitaltwin.rag_engine import RAGEngine  # noqa: E402  (reuse the exact chunking used by the Gradio app)
 from retriever import EMBEDDING_MODEL, INDEX_PATH  # noqa: E402
 
 PDF_PATH = os.path.join(ROOT, "linkedin.pdf")
@@ -33,12 +33,14 @@ LAMBDA_PLATFORM = "aarch64-manylinux2014"
 LAMBDA_PYTHON = "3.13"
 RUNTIME_PACKAGES = ["openai", "starlette", "uvicorn"]
 STARTUP_SCRIPT = "run.sh"
+# (source, path inside the zip): server.py imports digitaltwin.helpers, so it keeps its package folder
 CODE_FILES = [
-    os.path.join(HERE, "server.py"),
-    os.path.join(HERE, "retriever.py"),
-    os.path.join(HERE, STARTUP_SCRIPT),
-    INDEX_PATH,
-    os.path.join(ROOT, "helpers.py"),
+    (os.path.join(HERE, "server.py"), "server.py"),
+    (os.path.join(HERE, "retriever.py"), "retriever.py"),
+    (os.path.join(HERE, STARTUP_SCRIPT), STARTUP_SCRIPT),
+    (INDEX_PATH, "embeddings.json"),
+    (os.path.join(ROOT, "digitaltwin", "__init__.py"), "digitaltwin/__init__.py"),
+    (os.path.join(ROOT, "digitaltwin", "helpers.py"), "digitaltwin/helpers.py"),
 ]
 
 
@@ -122,8 +124,10 @@ def build_zip(out_dir):
             check=True,
         )
         os.remove(constraints)
-        for path in CODE_FILES:
-            shutil.copy2(path, build_dir)
+        for source, destination in CODE_FILES:
+            target = os.path.join(build_dir, *destination.split("/"))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(source, target)
         with open(os.path.join(build_dir, STARTUP_SCRIPT), "rb") as f:
             validate_startup_script(f.read())
 
