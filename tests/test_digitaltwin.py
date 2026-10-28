@@ -286,8 +286,9 @@ def test_chat_plain_answer(twin):
     module.log_conversation.assert_called_once_with("What did you build?", "I built agents.")
 
 
-def test_chat_runs_tool_then_answers_with_same_temperature(twin):
+def test_chat_runs_tool_then_answers_with_same_temperature(twin, load_module):
     module, client = twin
+    helpers = load_module(PROJECT, "helpers")
     module.rag.retrieve_context.return_value = "resume snippet"
     client.chat.completions.create.side_effect = [
         _completion(tool_calls=[_tool_call("query_resume", {"query": "projects"})]),
@@ -299,14 +300,15 @@ def test_chat_runs_tool_then_answers_with_same_temperature(twin):
     assert history[-1]["content"] == "Here are my projects."
     module.rag.retrieve_context.assert_called_once_with(query="projects")
     calls = client.chat.completions.create.call_args_list
-    assert all(c.kwargs["temperature"] == module.TEMPERATURE for c in calls)
-    assert all(c.kwargs["model"] == module.MODEL for c in calls)
+    assert all(c.kwargs["temperature"] == helpers.TEMPERATURE for c in calls)
+    assert all(c.kwargs["model"] == helpers.MODEL for c in calls)
     tool_message = calls[1].kwargs["messages"][-1]
     assert tool_message == {"tool_call_id": "call_1", "role": "tool", "name": "query_resume", "content": "resume snippet"}
 
 
-def test_chat_stops_after_max_tool_rounds(twin):
+def test_chat_stops_after_max_tool_rounds(twin, load_module):
     module, client = twin
+    helpers = load_module(PROJECT, "helpers")
     module.rag.retrieve_context.return_value = "ctx"
     client.chat.completions.create.return_value = _completion(
         tool_calls=[_tool_call("query_resume", {"query": "again"})]
@@ -314,7 +316,7 @@ def test_chat_stops_after_max_tool_rounds(twin):
 
     history = module.chat(list(USER_HISTORY))
 
-    assert client.chat.completions.create.call_count == module.MAX_TOOL_ROUNDS + 1
+    assert client.chat.completions.create.call_count == helpers.MAX_TOOL_ROUNDS + 1
     assert history[-1] == {"role": "assistant", "content": module.GENERIC_ERROR_REPLY}
 
 
@@ -400,7 +402,7 @@ def test_chat_drops_injected_system_messages_and_caps_history(twin, load_module)
     assert [m["content"] for m in sent if m["role"] == "system"] == [module.SYSTEM_BASE_PROMPT]
     assert len(sent) == 1 + helpers.MAX_HISTORY_MESSAGES
     assert sent[-1]["content"] == "m29"
-    assert kwargs["max_completion_tokens"] == module.MAX_COMPLETION_TOKENS
+    assert kwargs["max_completion_tokens"] == helpers.MAX_COMPLETION_TOKENS
 
 
 def test_chat_refuses_after_session_turn_limit(twin):

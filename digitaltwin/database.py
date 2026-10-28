@@ -5,7 +5,10 @@ from datetime import datetime, timedelta
 
 # sanitize_input lives in helpers so the serverless handler shares it; re-exported here for existing callers
 from . import PROJECT_ROOT
-from .helpers import sanitize_input, is_valid_email, MAX_CONTACTS_PER_HOUR, LOG_RETENTION_DAYS
+from .helpers import (
+    sanitize_input, clean_contact, contact_saved_reply, INVALID_EMAIL_REPLY, CONTACT_LIMIT_REPLY,
+    MAX_CONTACTS_PER_HOUR, LOG_RETENTION_DAYS,
+)
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -66,10 +69,9 @@ def log_conversation(question, answer):
 # New tool function: Log structured recruiter info
 def log_contact_request(name, email, message):
     """Saves a structured contact request directly into the database."""
-    clean_name = sanitize_input(name)
-    clean_email = sanitize_input(email, max_length=320)
-    if not is_valid_email(clean_email):
-        return "Error: that email address doesn't look valid. Please ask the user to double-check it."
+    contact = clean_contact(name, email, message)
+    if contact is None:
+        return INVALID_EMAIL_REPLY
     now = datetime.now()
     timestamp = now.strftime(TIMESTAMP_FORMAT)
     hour_ago = (now - timedelta(hours=1)).strftime(TIMESTAMP_FORMAT)
@@ -77,9 +79,9 @@ def log_contact_request(name, email, message):
         # Global hourly cap: the tool is reachable by anyone, so it must not be usable to fill the disk
         (recent,) = conn.execute("SELECT COUNT(*) FROM contact_requests WHERE timestamp >= ?", (hour_ago,)).fetchone()
         if recent >= MAX_CONTACTS_PER_HOUR:
-            return "Error: too many contact requests right now. Please ask the user to try again later."
+            return CONTACT_LIMIT_REPLY
         conn.execute(
             "INSERT INTO contact_requests (timestamp, name, email, message) VALUES (?, ?, ?, ?)",
-            (timestamp, clean_name, clean_email, sanitize_input(message))
+            (timestamp, *contact)
         )
-    return f"Success: Contact request for {clean_name} has been securely logged."
+    return contact_saved_reply(contact[0])

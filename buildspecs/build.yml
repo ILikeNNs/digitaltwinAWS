@@ -19,7 +19,7 @@ env:
     UV_CACHE_DIR: /root/.cache/uv
     UV_LINK_MODE: copy
     UV_NO_PROGRESS: "1"
-    # OPENAI_SECRET_NAME comes from the CodeBuild project; AWS_REGION is set by CodeBuild
+    # AWS_REGION is set by CodeBuild
 
 phases:
   install:
@@ -46,9 +46,10 @@ phases:
 
   build:
     commands:
-      # Embeds the resume only if linkedin.pdf changed (embeddings are cached in the artifact bucket by PDF hash).
+      # Resume embeddings come from the artifact bucket's cache (keyed by linkedin.pdf's hash). CI holds no OpenAI key,
+      # so a changed resume is embedded once from a developer machine first (README, "Day to day").
       # No pipe here: the command's own exit status must fail the build (stdout carries only the zip path).
-      - ZIP=$(uv run --frozen --group deploy python infra/deploy.py build serverless --out-dir dist --secret-name "${OPENAI_SECRET_NAME}" --region "${AWS_REGION}")
+      - ZIP=$(uv run --frozen --group deploy python infra/deploy.py build serverless --out-dir dist --cache-only --region "${AWS_REGION}")
       - echo "Built ${ZIP}"
       # Content-hashed key: an unchanged package reuses the uploaded version, so the deploy stage is a no-op
       - uv run --frozen --group deploy python infra/deploy.py publish serverless --zip "${ZIP}" --params-out params.json --region "${AWS_REGION}"

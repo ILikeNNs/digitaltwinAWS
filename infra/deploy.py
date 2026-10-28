@@ -116,13 +116,14 @@ def _download_if_exists(s3, bucket, key, path):
         raise
 
 
-def build_serverless(out_dir, session, secret_name=DEFAULT_SECRET_NAME):
+def build_serverless(out_dir, session, secret_name=DEFAULT_SECRET_NAME, embed=True):
     """Builds the arm64 Lambda zip (serverless/package.py), embedding the resume only when linkedin.pdf changed.
 
     Embeddings are cached in the artifact bucket under the PDF's hash. Embedding is not bit-for-bit reproducible, so
     without the cache every CI build (which starts without embeddings.json) would change the package and redeploy.
-    The OpenAI key comes from OPENAI_API_KEY if set, otherwise from the Secrets Manager secret; it is only needed on a
-    cache miss.
+    On a cache miss the OpenAI key comes from OPENAI_API_KEY if set, otherwise from the Secrets Manager secret.
+    embed=False (CI) fails on a cache miss instead: the pipeline holds no OpenAI key, so a changed resume is embedded
+    once from a developer machine (deploy.py build serverless), which also fills the cache.
     """
     sys.path.insert(0, os.path.join(ROOT, "serverless"))
     import package  # serverless/package.py; imported lazily because it pulls in the app's heavier dependencies
@@ -134,6 +135,9 @@ def build_serverless(out_dir, session, secret_name=DEFAULT_SECRET_NAME):
         cache_key = f"{EMBEDDINGS_CACHE_PREFIX}{package.pdf_sha256()}.json"
         if _download_if_exists(s3, bucket, cache_key, package.INDEX_PATH):
             print(f"Reused cached embeddings s3://{bucket}/{cache_key}", file=sys.stderr)
+        elif not embed:
+            raise RuntimeError(f"no cached embeddings for this linkedin.pdf (s3://{bucket}/{cache_key}); embed it once "
+                               "from your machine: uv run --group deploy python infra/deploy.py build serverless")
         else:
             if not os.environ.get("OPENAI_API_KEY"):
                 os.environ["OPENAI_API_KEY"] = read_openai_key(session.client("secretsmanager"), secret_name)
@@ -143,10 +147,10 @@ def build_serverless(out_dir, session, secret_name=DEFAULT_SECRET_NAME):
     return package.build_zip(out_dir)
 
 
-def build(target_name, out_dir, session, secret_name=DEFAULT_SECRET_NAME):
+def build(target_name, out_dir, session, secret_name=DEFAULT_SECRET_NAME, embed=True):
     if target_name == "ec2":
         return build_ec2(out_dir)  # the instance embeds the resume itself at startup
-    return build_serverless(out_dir, session, secret_name)
+    return build_serverless(out_dir, session, secret_name, embed)
 
 
 def audit_dependencies(work_dir):
@@ -641,6 +645,8 @@ def main(argv=None):
     p.add_argument("target", choices=TARGETS)
     p.add_argument("--out-dir", default=os.path.join(ROOT, "dist"))
     p.add_argument("--secret-name", default=DEFAULT_SECRET_NAME, help="serverless: key source when re-embedding")
+    p.add_argument("--cache-only", action="store_true",
+                   help="serverless: fail instead of embedding when the resume isn't in the embeddings cache (CI)")
     add_region(p)
 
     p = sub.add_parser("set-openai-key", help="store or rotate the OpenAI API key in Secrets Manager (prompts, hidden)")
@@ -684,7 +690,7 @@ def main(argv=None):
             return 0
         session = boto3.Session(region_name=getattr(args, "region", DEFAULT_REGION))
         if args.command == "build":
-            print(build(args.target, args.out_dir, session, args.secret_name))
+            print(build(args.target, args.out_dir, session, args.secret_name, embed=not args.cache_only))
             return 0
         if args.command == "set-openai-key":
             key = prompt_openai_key().strip()

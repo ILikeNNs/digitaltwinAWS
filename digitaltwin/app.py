@@ -1,5 +1,4 @@
 import os
-import json
 import gradio as gr
 from openai import OpenAI
 # Import modular layers
@@ -9,15 +8,13 @@ from .rag_engine import RAGEngine
 from dotenv import load_dotenv
 # Persona and model settings live in helpers so the serverless deployment shares them
 from .helpers import (
-    tools, SYSTEM_BASE_PROMPT, MODEL, TEMPERATURE, MAX_TOOL_ROUNDS, MAX_COMPLETION_TOKENS,
-    MAX_MESSAGE_LENGTH, MAX_SESSION_TURNS, LOG_RETENTION_DAYS, GENERIC_ERROR_REPLY, SESSION_LIMIT_REPLY,
-    sanitize_input, model_history, stream_reply,
+    SYSTEM_BASE_PROMPT, MAX_MESSAGE_LENGTH, MAX_SESSION_TURNS, LOG_RETENTION_DAYS, GENERIC_ERROR_REPLY,
+    SESSION_LIMIT_REPLY, sanitize_input, model_history, stream_reply, make_tool_handler,
 )
 
 load_dotenv(override=True)
 
 api_key = os.getenv('OPENAI_API_KEY')
-buildchroma = True
 
 PDF_PATH = os.path.join(PROJECT_ROOT, "linkedin.pdf")
 
@@ -29,37 +26,16 @@ client = OpenAI()
 # ----------------------------------------------------
 rag = RAGEngine(api_key=api_key)
 init_sql_db()
-if buildchroma:
-    rag.index_pdf(PDF_PATH)
+rag.index_pdf(PDF_PATH)
 
 # ----------------------------------------------------
 # 3. Chat Logic
 # ----------------------------------------------------
 
-def handle_tool_calls(message):
-    messages = []
-    for tool_call in message.tool_calls:
-        arguments = json.loads(tool_call.function.arguments)
-        if tool_call.function.name == "query_resume":
-            tool_output = rag.retrieve_context(query=arguments.get("query"))
-            print('used agent for rag')
-        elif tool_call.function.name == "save_contact_info":
-            tool_output = log_contact_request(
-                name=arguments.get("name"),
-                email=arguments.get("email"),
-                message=arguments.get("message")
-                )
-            print('used agent for saving contacts')
-        else:
-            tool_output = "Error: Tool not found."
-        messages.append({
-                "tool_call_id": tool_call.id,
-                "role": "tool",
-                "name": tool_call.function.name,
-                "content": tool_output,
-            })
-    return messages
-
+# Tool calls go to the Chroma index and the SQLite contact log; the dispatch is shared with serverless/server.py
+handle_tool_calls = make_tool_handler(
+    rag.retrieve_context, log_contact_request, on_tool_call=lambda name: print(f"tool call: {name}"),
+)
 
 
 def chat_stream(history):

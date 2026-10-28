@@ -1,3 +1,4 @@
+import json
 import re
 from types import SimpleNamespace
 
@@ -40,6 +41,23 @@ def sanitize_input(text, max_length=1000):
 
 def is_valid_email(email):
     return bool(EMAIL_PATTERN.match(email or ""))
+
+
+# Contact tool results go back to the model, which relays them to the visitor; both apps store contacts with these
+INVALID_EMAIL_REPLY = "Error: that email address doesn't look valid. Please ask the user to double-check it."
+CONTACT_LIMIT_REPLY = "Error: too many contact requests right now. Please ask the user to try again later."
+
+
+def clean_contact(name, email, message):
+    """Sanitizes a contact request for storage: (name, email, message), or None when the email isn't plausible."""
+    email = sanitize_input(email, max_length=320)
+    if not is_valid_email(email):
+        return None
+    return sanitize_input(name), email, sanitize_input(message)
+
+
+def contact_saved_reply(name):
+    return f"Success: Contact request for {name} has been securely logged."
 
 
 def model_history(history):
@@ -93,6 +111,35 @@ tools = [
         }
     }
 ]
+
+
+def make_tool_handler(query_resume, save_contact_info, on_tool_call=None):
+    """Builds stream_reply's `handle_tool_calls` callback from the two tool implementations.
+
+    The apps differ only in where the resume is searched and contacts are stored; `on_tool_call(name)` is told about
+    every call, for logging.
+    """
+    def handle_tool_calls(message):
+        messages = []
+        for tool_call in message.tool_calls:
+            name = tool_call.function.name
+            arguments = json.loads(tool_call.function.arguments)
+            if name == "query_resume":
+                tool_output = query_resume(query=arguments.get("query"))
+            elif name == "save_contact_info":
+                tool_output = save_contact_info(
+                    name=arguments.get("name"),
+                    email=arguments.get("email"),
+                    message=arguments.get("message"),
+                )
+            else:
+                tool_output = "Error: Tool not found."
+            if on_tool_call:
+                on_tool_call(name)
+            messages.append({"tool_call_id": tool_call.id, "role": "tool", "name": name, "content": tool_output})
+        return messages
+
+    return handle_tool_calls
 
 
 def stream_reply(client, messages, handle_tool_calls):

@@ -363,21 +363,11 @@ class _FakeS3:
         self.calls.append(("upload", key))
 
 
-@pytest.mark.parametrize("stale, cached, env_key, expected", [
-    # resume unchanged: nothing to fetch, no key needed
-    (False, False, None, []),
-    # resume changed, but embedded before (any machine): reuse the cache, no OpenAI call
-    (True, True, None, ["download"]),
-    # first build of a new resume locally: key from Secrets Manager, embed, cache the result
-    (True, False, None, ["download", "secret", "build_index:sk-secret", "upload"]),
-    # first build of a new resume on CodeBuild: key already in the environment
-    (True, False, "sk-env", ["download", "build_index:sk-env", "upload"]),
-])
-def test_build_serverless_embeds_only_on_cache_miss(deploy, monkeypatch, tmp_path, stale, cached, env_key, expected):
+def _fake_serverless_build(deploy, monkeypatch, tmp_path, stale, cached, events):
+    """Stands in for package.py, S3, STS and the secret; `events` records secret reads and index builds."""
     import sys
     import types
 
-    events = []
     fake_package = types.SimpleNamespace(
         INDEX_PATH=str(tmp_path / "embeddings.json"),
         index_is_stale=lambda: stale,
@@ -386,18 +376,33 @@ def test_build_serverless_embeds_only_on_cache_miss(deploy, monkeypatch, tmp_pat
         build_zip=lambda out_dir: os.path.join(out_dir, "chat.zip"),
     )
     monkeypatch.setitem(sys.modules, "package", fake_package)
-    if env_key:
-        monkeypatch.setenv("OPENAI_API_KEY", env_key)
-    else:
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(deploy, "read_openai_key", lambda sm, name: events.append("secret") or "sk-secret")
-
     s3 = _FakeS3(cached)
     session = types.SimpleNamespace(
         region_name="eu-north-1",
         client=lambda service, **kw: s3 if service == "s3" else types.SimpleNamespace(
             get_caller_identity=lambda: {"Account": "123456789012"}),
     )
+    return s3, session
+
+
+@pytest.mark.parametrize("stale, cached, env_key, expected", [
+    # resume unchanged: nothing to fetch, no key needed
+    (False, False, None, []),
+    # resume changed, but embedded before (any machine): reuse the cache, no OpenAI call
+    (True, True, None, ["download"]),
+    # first build of a new resume: key from Secrets Manager, embed, cache the result
+    (True, False, None, ["download", "secret", "build_index:sk-secret", "upload"]),
+    # first build of a new resume with OPENAI_API_KEY already set (e.g. from .env): no secret read
+    (True, False, "sk-env", ["download", "build_index:sk-env", "upload"]),
+])
+def test_build_serverless_embeds_only_on_cache_miss(deploy, monkeypatch, tmp_path, stale, cached, env_key, expected):
+    events = []
+    s3, session = _fake_serverless_build(deploy, monkeypatch, tmp_path, stale, cached, events)
+    if env_key:
+        monkeypatch.setenv("OPENAI_API_KEY", env_key)
+    else:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     assert deploy.build_serverless(str(tmp_path), session) == os.path.join(str(tmp_path), "chat.zip")
     timeline = [c[0] for c in s3.calls] + events
@@ -405,6 +410,21 @@ def test_build_serverless_embeds_only_on_cache_miss(deploy, monkeypatch, tmp_pat
     timeline.sort(key=lambda e: order.get(e, 2 if e.startswith("build_index") else 3))
     assert timeline == expected
     assert all(key == "embeddings/abc123.json" for _, key in s3.calls)
+
+
+@pytest.mark.parametrize("cached", [True, False])
+def test_build_serverless_cache_only_never_embeds(deploy, monkeypatch, tmp_path, cached):
+    # CodeBuild holds no OpenAI key: a new resume must have been embedded (and cached) from a developer machine
+    events = []
+    s3, session = _fake_serverless_build(deploy, monkeypatch, tmp_path, True, cached, events)
+
+    if cached:
+        assert deploy.build_serverless(str(tmp_path), session, embed=False) == os.path.join(str(tmp_path), "chat.zip")
+    else:
+        with pytest.raises(RuntimeError, match="no cached embeddings.*build serverless"):
+            deploy.build_serverless(str(tmp_path), session, embed=False)
+    assert events == []
+    assert s3.calls == [("download", "embeddings/abc123.json")]
 
 
 # ======================= pipeline bootstrap =======================
@@ -494,6 +514,22 @@ def test_permissions_boundary_covers_every_app_role_permission():
                 needed += list(_actions(policy["PolicyDocument"]["Statement"]))
     uncovered = [a for a in needed if not any(fnmatch.fnmatchcase(a.lower(), b.lower()) for b in boundary)]
     assert not uncovered, f"app roles need actions outside WorkloadPermissionsBoundary: {uncovered}"
+
+
+def test_permissions_boundary_is_scoped_to_the_app():
+    # The repository writes the app roles' own policies, so only the boundary limits what a malicious commit can reach.
+    # X-Ray has no resource-level permissions; everything else must name this app's resources.
+    pipeline = _load_template("pipeline.yaml")
+    statements = pipeline["Resources"]["WorkloadPermissionsBoundary"]["Properties"]["PolicyDocument"]["Statement"]
+    unscoped = [a for s in statements if s["Resource"] == "*" for a in _actions([s])]
+    assert unscoped and all(a.startswith("xray:") for a in unscoped), f"unscoped boundary actions: {unscoped}"
+
+
+def test_build_role_cannot_read_secrets():
+    # The build runs repository code (tests, packaging) and only reads cached embeddings, so it never needs the key
+    build_role = _load_template("pipeline.yaml")["Resources"]["BuildRole"]
+    actions = [a for p in build_role["Properties"]["Policies"] for a in _actions(p["PolicyDocument"]["Statement"])]
+    assert not [a for a in actions if a.startswith("secretsmanager:")]
 
 
 def test_pipeline_parameter_overrides_match_the_app_template():

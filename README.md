@@ -14,7 +14,7 @@ The project is modularized (as it should be):
 
 **The app (`digitaltwin/`, Gradio, runs locally and on EC2)**: run it with `uv run python -m digitaltwin.app`. Its data (`linkedin.pdf`, `conversation_logs.db`, `chroma_db/`) stays at the repository root.
 - **app.py** contains the Gradio web UI. Replies stream as they're generated, and the conversation is kept server-side, so visitors can't rewrite earlier turns.
-- **helpers.py** contains what both versions share: the persona prompt, model settings and spend limits, the tool definitions, input sanitizing, and the streaming tool-calling loop.
+- **helpers.py** contains what both versions share: the persona prompt, model settings and spend limits, the tool definitions and dispatch, input sanitizing, contact validation, and the streaming tool-calling loop.
 - **database.py** contains the SQLite logging of conversations (deleted after a year) and contact requests (with an email check and an hourly cap).
 - **rag_engine.py** contains a RAGEngine class that chunks the resume, stores it in Chroma and retrieves the most relevant chunks for a question.
 
@@ -164,18 +164,18 @@ Commits that only touch `*.md` files or `screenshots/` don't trigger a run.
 | Deploy | CloudFormation | the stack update fails; CloudFormation rolls back automatically |
 | Publish | Smoke tests (`deploy.py smoke-test`) | the site doesn't serve this commit's `index.html` with its security headers, static assets fail, `POST /api/chat` doesn't return the app's own 400 for an empty message, or the Function URL accepts an unsigned direct call |
 
-The Lambda package is reproducible: unchanged code produces the same content-hashed S3 key, so the Deploy stage is a no-op. Resume embeddings are cached in the artifact bucket under `linkedin.pdf`'s SHA-256, so the OpenAI embeddings API is only called when the PDF changes.
+The Lambda package is reproducible: unchanged code produces the same content-hashed S3 key, so the Deploy stage is a no-op. Resume embeddings are cached in the artifact bucket under `linkedin.pdf`'s SHA-256. The pipeline holds no OpenAI key and only reads that cache, so a new resume is embedded once from your machine before you push it (see [Day to day](#day-to-day)).
 
 #### Security model
 
 | Role | Can | Can't |
 |---|---|---|
 | Pipeline | read **only** `ILikeNNs/digitaltwinAWS` through the GitHub connection, start the two builds, deploy the app stack via the deploy role | read other repositories, touch other stacks |
-| Build | upload under `lambda/` and `embeddings/` in the artifact bucket, read the OpenAI key (only needed when re-embedding) | deploy anything, change bucket settings |
+| Build | upload under `lambda/` in the artifact bucket, read cached embeddings under `embeddings/` | deploy anything, change bucket settings, read the OpenAI key |
 | Publish | write the site bucket, invalidate CloudFront, read the app stack's outputs | change infrastructure |
 | CloudFormation deploy | create, update and delete exactly the resource types in `serverless.yaml`, scoped to `digitaltwin-serverless-*` names where AWS allows | create an IAM role **without** the `WorkloadPermissionsBoundary` |
 
-The last row is the privilege-escalation guard. A role that can create roles could otherwise create an admin role, so control of the repository would mean control of the account. Every role the pipeline creates must carry a permissions boundary that caps it at what the chatbot needs (DynamoDB, logs, X-Ray, one secret, SNS, KMS). Tests keep the boundary in sync with the app roles' permissions.
+The last row is the privilege-escalation guard. A role that can create roles could otherwise create an admin role, so control of the repository would mean control of the account. Every role the pipeline creates must carry a permissions boundary that caps it at what the chatbot needs, on this app's resources only: its DynamoDB table, log groups and SNS topics, the OpenAI secret, KMS through those services, and X-Ray. The resources matter as much as the actions, because the repository writes the roles' own policies: a malicious commit can't read other secrets or tables in the account. The one thing it can reach is the OpenAI key, since the Lambda needs it to run; the budget limit on the OpenAI project caps that risk. Tests keep the boundary in sync with the app roles' permissions.
 
 Pipeline artifacts and build logs are encrypted with a customer-managed KMS key, artifacts expire after 30 days, and tool versions are pinned (the cfn-guard binary is verified by SHA-256).
 
@@ -199,6 +199,7 @@ If the account's Lambda concurrency quota is below 105, the global cap of 5 simu
 #### Day to day
 
 - **Deploy:** push to `main`. Pipeline failures are emailed to the notification address.
+- **Update the resume:** replace `linkedin.pdf`, run `uv run --group deploy python infra/deploy.py build serverless` once (it embeds the new resume with the stored key and caches the result in the artifact bucket), then push. Without this step the Build stage fails with `no cached embeddings`.
 - **Watch a run:** use the `PipelineConsoleUrl` output of the `digitaltwin-pipeline` stack. Build and publish logs are in CloudWatch Logs under `/aws/codebuild/digitaltwin-pipeline-*`.
 - **Roll back:** revert the commit and push (`git revert <sha> && git push`). This redeploys the previous code *and* site through every check. For an urgent rollback of the stack alone, CodePipeline can re-run the Deploy stage with an earlier successful execution's artifacts (`aws codepipeline rollback-stage`), but that leaves the site files as they are.
 - **Rotate the OpenAI key:** `uv run --group deploy python infra/deploy.py set-openai-key`. No deploy is needed; the Lambda picks the new key up when OpenAI rejects the old one.
@@ -209,6 +210,7 @@ If the account's Lambda concurrency quota is below 105, the global cap of 5 simu
 |---|---|
 | Deploy fails with `... is not authorized to perform: <action>` | The deploy role lacks a permission a new or changed resource needs. Add the action to `CfnDeployRole` in `infra/pipeline.yaml` (scoped like its neighbours), re-run the bootstrap, then retry the stage. |
 | Stack stuck in `ROLLBACK_FAILED` / `DELETE_FAILED` | A resource couldn't be deleted during rollback. Run `delete-stack` once (it fails again, leaving the stack in `DELETE_FAILED`), then again with `--retain-resources <LogicalId>` for the resource that failed. Remove the failed attempt's leftovers by hand: retained tables and site buckets keep their `digitaltwin-serverless-` names. Then push or retry. |
+| Build fails with `no cached embeddings` | `linkedin.pdf` changed but hasn't been embedded yet. Run `uv run --group deploy python infra/deploy.py build serverless` on your machine, then retry the Build stage or push again. |
 | Build fails in `pip-audit` | A dependency the Lambda ships has a published vulnerability. Update it (`uv lock --upgrade-package <name>`), commit, push. |
 | Publish fails a smoke test | The message names the failing check. A new CloudFront distribution can take a few minutes to propagate, so checks retry for up to 5 minutes before failing. |
 

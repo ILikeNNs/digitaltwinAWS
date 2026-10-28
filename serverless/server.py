@@ -28,10 +28,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.routing import Route
 
-# Shared with the Gradio app: persona, model settings, tool schemas, limits, sanitizing and the streaming loop
+# Shared with the Gradio app: persona, model settings, tool schemas and dispatch, limits, sanitizing, contact
+# validation and the streaming loop
 from digitaltwin.helpers import (
-    SYSTEM_BASE_PROMPT, MAX_MESSAGE_LENGTH, MAX_SESSION_TURNS, MAX_CONTACTS_PER_HOUR,
-    GENERIC_ERROR_REPLY, SESSION_LIMIT_REPLY, sanitize_input, is_valid_email, model_history, stream_reply,
+    SYSTEM_BASE_PROMPT, MAX_MESSAGE_LENGTH, MAX_SESSION_TURNS, MAX_CONTACTS_PER_HOUR, GENERIC_ERROR_REPLY,
+    SESSION_LIMIT_REPLY, INVALID_EMAIL_REPLY, CONTACT_LIMIT_REPLY, sanitize_input, clean_contact, contact_saved_reply,
+    model_history, make_tool_handler, stream_reply,
 )
 from retriever import Retriever
 
@@ -132,14 +134,14 @@ def _recent_contact_count():
 
 def log_contact_request(name, email, message):
     """Saves a structured contact request; a DynamoDB stream -> EventBridge Pipe forwards it by email."""
-    clean_name = sanitize_input(name)
-    clean_email = sanitize_input(email, max_length=320)
-    if not is_valid_email(clean_email):
-        return "Error: that email address doesn't look valid. Please ask the user to double-check it."
+    contact = clean_contact(name, email, message)
+    if contact is None:
+        return INVALID_EMAIL_REPLY
     if _recent_contact_count() >= MAX_CONTACTS_PER_HOUR:
-        return "Error: too many contact requests right now. Please ask the user to try again later."
-    _put_record("CONTACT", name=clean_name, email=clean_email, message=sanitize_input(message))
-    return f"Success: Contact request for {clean_name} has been securely logged."
+        return CONTACT_LIMIT_REPLY
+    clean_name, clean_email, clean_message = contact
+    _put_record("CONTACT", name=clean_name, email=clean_email, message=clean_message)
+    return contact_saved_reply(clean_name)
 
 
 def load_session(session_id):
@@ -163,28 +165,10 @@ def save_session(session_id, history):
 # Chat logic (mirrors app.py)
 # ----------------------------------------------------
 
-def handle_tool_calls(message):
-    messages = []
-    for tool_call in message.tool_calls:
-        arguments = json.loads(tool_call.function.arguments)
-        if tool_call.function.name == "query_resume":
-            tool_output = rag.retrieve_context(query=arguments.get("query"))
-        elif tool_call.function.name == "save_contact_info":
-            tool_output = log_contact_request(
-                name=arguments.get("name"),
-                email=arguments.get("email"),
-                message=arguments.get("message"),
-            )
-        else:
-            tool_output = "Error: Tool not found."
-        logger.info("tool call", extra={"tool": tool_call.function.name})
-        messages.append({
-            "tool_call_id": tool_call.id,
-            "role": "tool",
-            "name": tool_call.function.name,
-            "content": tool_output,
-        })
-    return messages
+handle_tool_calls = make_tool_handler(
+    rag.retrieve_context, log_contact_request,
+    on_tool_call=lambda name: logger.info("tool call", extra={"tool": name}),
+)
 
 
 def _line(**fields):

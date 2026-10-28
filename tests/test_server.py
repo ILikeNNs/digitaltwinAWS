@@ -35,7 +35,7 @@ def server(monkeypatch):
         get_secret_value=lambda SecretId: {"SecretString": state["stored_key"]}))
     monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
     retriever = types.ModuleType("retriever")
-    retriever.Retriever = lambda client: types.SimpleNamespace(client=client)
+    retriever.Retriever = lambda client: types.SimpleNamespace(client=client, retrieve_context=lambda query: "")
     monkeypatch.setitem(sys.modules, "retriever", retriever)
     monkeypatch.syspath_prepend(ROOT)
 
